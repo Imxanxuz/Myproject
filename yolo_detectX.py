@@ -4,13 +4,14 @@ import argparse
 import glob
 import time
 import threading
-import queue
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 # -------------------- Keep only 8 classes --------------------
-KEEP_IDS = [0, 1, 2, 3, 5, 9, 15, 16]  # person,bicycle,car,motorcycle,bus,traffic light,cat,dog
+# COCO IDs: person(0), bicycle(1), car(2), motorcycle(3), bus(5),
+# traffic light(9), cat(15), dog(16)
+KEEP_IDS = [0, 1, 2, 3, 5, 9, 15, 16]
 # -------------------------------------------------------------
 
 def parse_args():
@@ -24,9 +25,9 @@ def parse_args():
     p.add_argument('--opencv-threads', type=int, default=1, help='cv2.setNumThreads()')
     # camera/video tuning
     p.add_argument('--mjpeg', action='store_true', help='force MJPEG on USB cam (good for USB2/RPi)')
-    p.add_argument('--fps', type=int, default=30, help='target display/camera FPS')
-    p.add_argument('--drop', type=int, default=0, help='grab-and-drop old frames before retrieve (0=smooth)')
-    # speed trick
+    p.add_argument('--fps', type=int, default=30, help='request camera FPS')
+    p.add_argument('--drop', type=int, default=2, help='grab-and-drop old frames before retrieve')
+    # speed tricks
     p.add_argument('--detect-interval', type=int, default=1,
                    help='run detection every N frames (>=1); skipped frames reuse last result')
     p.add_argument('--nodraw', action='store_true', help='skip drawing boxes (measure pure inference)')
@@ -58,9 +59,10 @@ def try_open_usb(usb_idx, resW, resH, fps, force_mjpeg):
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         elif fourcc == 'YUYV':
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+
         ok, frame = cap.read()
         if ok and frame is not None:
-            return cap
+            return cap  # success
         last_err = f"opened but no frame (backend={backend}, fourcc={fourcc})"
         cap.release()
     raise RuntimeError(f"USB cam open failed: {last_err}")
@@ -75,8 +77,9 @@ def wait_first_frame(cam_thread, timeout_sec=3.0):
     return False
 # ---------------------------------------------------------
 
+# ---------- Camera thread for low-latency grabbing ----------
 class CameraThread:
-    def __init__(self, cap, drop=0):
+    def __init__(self, cap, drop=2):
         self.cap = cap
         self.drop = max(0, drop)
         self.lock = threading.Lock()
@@ -105,63 +108,12 @@ class CameraThread:
     def release(self):
         self.stopped = True
         self.th.join(timeout=0.5)
-
-# -------- async inference worker (keeps display smooth) -----
-class InferenceWorker:
-    def __init__(self, model, imgsz, keep_ids, min_thresh):
-        self.model = model
-        self.imgsz = imgsz
-        self.keep_ids = keep_ids
-        self.min_thresh = min_thresh
-        self.q = queue.Queue(maxsize=1)  # latest-only
-        self.lock = threading.Lock()
-        self.last_boxes = np.empty((0,4), dtype=int)
-        self.last_confs = np.empty((0,), dtype=float)
-        self.last_clss  = np.empty((0,), dtype=int)
-        self.stopped = False
-        self.th = threading.Thread(target=self.run, daemon=True)
-        self.th.start()
-
-    def run(self):
-        while not self.stopped:
-            try:
-                frame = self.q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            results = self.model.predict(frame, imgsz=self.imgsz, classes=self.keep_ids, verbose=False)
-            det = results[0].boxes
-            if len(det) > 0:
-                boxes = det.xyxy.cpu().numpy().astype(int)
-                confs = det.conf.cpu().numpy()
-                clss  = det.cls.cpu().numpy().astype(int)
-                mask = (confs >= self.min_thresh) & np.isin(clss, self.keep_ids)
-                boxes, confs, clss = boxes[mask], confs[mask], clss[mask]
-            else:
-                boxes = np.empty((0,4), dtype=int)
-                confs = np.empty((0,), dtype=float)
-                clss  = np.empty((0,), dtype=int)
-            with self.lock:
-                self.last_boxes, self.last_confs, self.last_clss = boxes, confs, clss
-
-    def submit(self, frame):
-        try:
-            self.q.put_nowait(frame)  # copy not necessary; cv2 frames are new each loop
-        except queue.Full:
-            pass
-
-    def get(self):
-        with self.lock:
-            return self.last_boxes.copy(), self.last_confs.copy(), self.last_clss.copy()
-
-    def stop(self):
-        self.stopped = True
-        self.th.join(timeout=0.5)
 # ------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    # tame BLAS/Torch/OpenCV threads
+    # threads for BLAS/Torch/OpenCV
     os.environ.setdefault('OMP_NUM_THREADS', str(args.torch_threads))
     os.environ.setdefault('OPENBLAS_NUM_THREADS', str(args.torch_threads))
     os.environ.setdefault('MKL_NUM_THREADS', str(args.torch_threads))
@@ -188,13 +140,15 @@ def main():
 
     cv2.setUseOptimized(True)
 
-    # Load model + warmup
+    # Load model
     model = YOLO(model_path, task='detect')
-    labels = model.names
+    labels = model.names  # dict {id:name}
+
+    # warmup once at target imgsz
     _ = model.predict(np.zeros((imgsz, imgsz, 3), dtype=np.uint8),
                       imgsz=imgsz, classes=KEEP_IDS, verbose=False)
 
-    # Identify source
+    # Detect source type (more robust)
     img_ext_list = ['.jpg','.JPG','.jpeg','.JPEG','.png','.PNG','.bmp','.BMP']
     vid_ext_list = ['.avi','.mov','.mp4','.mkv','.wmv']
 
@@ -202,37 +156,55 @@ def main():
         source_type = 'folder'
     elif os.path.isfile(img_source):
         _, ext = os.path.splitext(img_source)
-        source_type = 'image' if ext in img_ext_list else 'video' if ext in vid_ext_list else None
-        if source_type is None:
-            print(f'Unsupported file extension: {ext}'); sys.exit(0)
+        if ext in img_ext_list:
+            source_type = 'image'
+        elif ext in vid_ext_list:
+            source_type = 'video'
+        else:
+            print(f'Unsupported file extension: {ext}')
+            sys.exit(0)
     elif img_source.isdigit():
-        source_type = 'usb'; usb_idx = int(img_source)
+        source_type = 'usb'
+        usb_idx = int(img_source)
     elif img_source.startswith('/dev/video'):
-        source_type = 'usb'; digits = ''.join([c for c in img_source if c.isdigit()]); usb_idx = int(digits or '0')
+        source_type = 'usb'
+        digits = ''.join([c for c in img_source if c.isdigit()])
+        usb_idx = int(digits) if digits else 0
     elif img_source.startswith('usb'):
-        source_type = 'usb'; usb_idx = int(img_source[3:])
+        source_type = 'usb'
+        usb_idx = int(img_source[3:])  # usb0 -> 0
     elif 'picamera' in img_source:
-        source_type = 'picamera'; picam_idx = int(img_source[8:])
+        source_type = 'picamera'
+        picam_idx = int(img_source[8:])
     else:
-        print(f'Invalid source: {img_source}'); sys.exit(0)
+        print(f'Invalid source: {img_source}')
+        sys.exit(0)
 
+    # Display resolution
     resize = False
     if user_res:
         resize = True
         resW, resH = map(int, user_res.split('x'))
 
+    # Load/init source
     cam_thread = None
     if source_type == 'image':
         imgs_list = [img_source]
+
     elif source_type == 'folder':
-        imgs_list = [f for f in glob.glob(os.path.join(img_source, '*'))
-                     if os.path.splitext(f)[1] in img_ext_list]
+        imgs_list = []
+        for file in glob.glob(os.path.join(img_source, '*')):
+            _, file_ext = os.path.splitext(file)
+            if file_ext in img_ext_list:
+                imgs_list.append(file)
+
     elif source_type == 'video':
         cap = cv2.VideoCapture(img_source)
         if user_res:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  resW)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resH)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
     elif source_type == 'usb':
         cap = try_open_usb(usb_idx, resW if user_res else None,
                            resH if user_res else None, args.fps, args.mjpeg)
@@ -240,11 +212,13 @@ def main():
         if not wait_first_frame(cam_thread, timeout_sec=3.0):
             print("Camera opened but no frames within timeout. Try removing --mjpeg or use /dev/videoX.")
             sys.exit(0)
+
     elif source_type == 'picamera':
         from picamera2 import Picamera2
         cap = Picamera2()
         if not user_res:
-            resW, resH = 640, 480; resize = True
+            resW, resH = 640, 480
+            resize = True
         cap.configure(cap.create_video_configuration(main={"format": 'RGB888', "size": (resW, resH)}))
         cap.start()
 
@@ -254,91 +228,118 @@ def main():
         (96,202,231), (159,124,168), (169,162,241), (98,118,150), (172,176,184)
     ]
 
-    # async inference worker
-    worker = InferenceWorker(model, imgsz, KEEP_IDS, min_thresh)
-
     avg_frame_rate = 0.0
     frame_rate_buffer = []
     fps_avg_len = 200
     img_count = 0
+
+    # cache last detections for interval skipping
+    last_boxes = np.empty((0, 4), dtype=int)
+    last_confs = np.empty((0,), dtype=float)
+    last_clss  = np.empty((0,), dtype=int)
+
     frame_idx = 0
-    frame_period = 1.0 / max(1, args.fps)
 
     while True:
-        loop_start = time.perf_counter()
+        t_start = time.perf_counter()
 
         # Grab frame
         if source_type in ('image','folder'):
             if img_count >= len(imgs_list):
-                print('All images processed. Exiting.'); break
-            frame = cv2.imread(imgs_list[img_count]); img_count += 1
+                print('All images processed. Exiting.')
+                break
+            img_filename = imgs_list[img_count]
+            frame = cv2.imread(img_filename)
+            img_count += 1
+
         elif source_type == 'video':
             ret, frame = cap.read()
             if not ret:
-                print('Reached end of video. Exiting.'); break
+                print('Reached end of video. Exiting.')
+                break
+
         elif source_type == 'usb':
             frame = cam_thread.read()
             if frame is None:
-                time.sleep(0.005); continue
+                time.sleep(0.005)
+                continue
+
         elif source_type == 'picamera':
             frame_rgb = cap.capture_array()
             if frame_rgb is None:
-                print('Unable to read from Picamera. Exiting.'); break
+                print('Unable to read from Picamera. Exiting.')
+                break
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
         if resize:
             frame = cv2.resize(frame, (resW, resH))
 
-        # submit to async worker at interval
-        if frame_idx % detect_every == 0:
-            worker.submit(frame)
+        run_detect = (frame_idx % detect_every == 0)
+        if run_detect:
+            results = model.predict(frame, imgsz=imgsz, classes=KEEP_IDS, verbose=False)
+            det = results[0].boxes
 
-        # get last results (instant)
-        boxes, confs, clss = worker.get()
-        object_count = int(len(boxes))
+            if len(det) > 0:
+                boxes = det.xyxy.cpu().numpy().astype(int)
+                confs = det.conf.cpu().numpy()
+                clss  = det.cls.cpu().numpy().astype(int)
+                mask = (confs >= min_thresh) & np.isin(clss, KEEP_IDS)
+                last_boxes = boxes[mask]
+                last_confs = confs[mask]
+                last_clss  = clss[mask]
+            else:
+                last_boxes = np.empty((0,4), dtype=int)
+                last_confs = np.empty((0,), dtype=float)
+                last_clss  = np.empty((0,), dtype=int)
 
-        # draw
-        if not args.nodraw:
-            for (xmin, ymin, xmax, ymax), c, k in zip(boxes, confs, clss):
+        object_count = int(len(last_boxes))
+
+        # Draw (optional)
+        if not args.nodraw and object_count > 0:
+            for (xmin, ymin, xmax, ymax), c, k in zip(last_boxes, last_confs, last_clss):
                 color = bbox_colors[k % len(bbox_colors)]
                 cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
                 name = labels[k] if isinstance(labels, dict) else str(labels[k])
                 text = f'{name} {int(c*100)}%'
                 cv2.putText(frame, text, (xmin, max(15, ymin-6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            cv2.putText(frame, f'FPS: {avg_frame_rate:0.2f}', (10,20),
-                        cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
-            cv2.putText(frame, f'Objects (8 classes): {object_count}', (10,40),
-                        cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
-            cv2.imshow('YOLO realtime (smooth, 8 classes)', frame)
 
-        # keys
+        # FPS overlay
+        if source_type in ('video','usb','picamera') and not args.nodraw:
+            cv2.putText(frame, f'FPS: {avg_frame_rate:0.2f}',
+                        (10,20), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
+
+        # Display only (no saving)
+        if not args.nodraw:
+            cv2.putText(frame, f'Objects (8 classes): {object_count}',
+                        (10,40), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
+            cv2.imshow('YOLO realtime (8 classes)', frame)
+
+        # Keys: just quit/pause (no save)
         key = cv2.waitKey(1 if source_type in ('video','usb','picamera') else 0)
-        if key in (ord('q'), ord('Q')): break
-        elif key in (ord('s'), ord('S')): cv2.waitKey()
+        if key in (ord('q'), ord('Q')):
+            break
+        elif key in (ord('s'), ord('S')):
+            cv2.waitKey()
 
-        # FPS (display pacing)
-        loop_elapsed = time.perf_counter() - loop_start
-        sleep_remain = frame_period - loop_elapsed
-        if sleep_remain > 0 and source_type in ('usb','picamera'):
-            time.sleep(sleep_remain)
-
-        # fps calc
-        total_elapsed = time.perf_counter() - loop_start
-        fps_inst = 1.0 / max(1e-6, total_elapsed)
+        # FPS calc
+        t_stop = time.perf_counter()
+        frame_rate_calc = float(1.0 / max(1e-6, (t_stop - t_start)))
         if len(frame_rate_buffer) >= fps_avg_len:
             frame_rate_buffer.pop(0)
-        frame_rate_buffer.append(fps_inst)
+        frame_rate_buffer.append(frame_rate_calc)
         avg_frame_rate = float(np.mean(frame_rate_buffer))
+
         frame_idx += 1
 
-    # cleanup
+    # Clean up
+    print(f'Average pipeline FPS: {avg_frame_rate:.2f}')
     try:
-        worker.stop()
         if source_type == 'video':
             cap.release()
         elif source_type == 'usb':
-            if cam_thread: cam_thread.release()
+            if cam_thread:
+                cam_thread.release()
             cap.release()
         elif source_type == 'picamera':
             cap.stop()
