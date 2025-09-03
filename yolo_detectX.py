@@ -17,10 +17,9 @@ KEEP_IDS = [0, 1, 2, 3, 5, 9, 15, 16]
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--model', required=True, help='YOLO model path (.pt)')
-    p.add_argument('--source', required=True, help='file/folder/video or "usb0" alias')
+    p.add_argument('--source', required=True, help='file/folder/video or "usb0"/index or "/dev/videoX"')
     p.add_argument('--thresh', type=float, default=0.5, help='confidence threshold')
     p.add_argument('--resolution', default=None, help='WxH display/output (e.g. 640x480)')
-    p.add_argument('--record', action='store_true', help='record to demo1.avi (needs --resolution)')
     p.add_argument('--imgsz', type=int, default=320, help='inference size (e.g. 256/288/320/384)')
     p.add_argument('--torch-threads', type=int, default=2, help='torch.set_num_threads() & BLAS env')
     p.add_argument('--opencv-threads', type=int, default=1, help='cv2.setNumThreads()')
@@ -33,6 +32,50 @@ def parse_args():
                    help='run detection every N frames (>=1); skipped frames reuse last result')
     p.add_argument('--nodraw', action='store_true', help='skip drawing boxes (measure pure inference)')
     return p.parse_args()
+
+# ---------- helpers: robust USB open & warm-up ----------
+def try_open_usb(usb_idx, resW, resH, fps, force_mjpeg):
+    attempts = [
+        (cv2.CAP_V4L2, 'MJPG') if force_mjpeg else (cv2.CAP_V4L2, None),
+        (cv2.CAP_V4L2, 'YUYV'),
+        (cv2.CAP_ANY,  'MJPG') if force_mjpeg else (cv2.CAP_ANY,  None),
+        (cv2.CAP_ANY,  'YUYV'),
+        (cv2.CAP_ANY,  None),
+    ]
+    last_err = None
+    for backend, fourcc in attempts:
+        cap = cv2.VideoCapture(usb_idx, backend)
+        if not cap.isOpened():
+            cap.release()
+            last_err = f"cannot open (backend={backend})"
+            continue
+        if resW and resH:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  int(resW))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(resH))
+        if fps:
+            cap.set(cv2.CAP_PROP_FPS, int(fps))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if fourcc == 'MJPG':
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        elif fourcc == 'YUYV':
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return cap  # success
+        last_err = f"opened but no frame (backend={backend}, fourcc={fourcc})"
+        cap.release()
+    raise RuntimeError(f"USB cam open failed: {last_err}")
+
+def wait_first_frame(cam_thread, timeout_sec=3.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout_sec:
+        f = cam_thread.read()
+        if f is not None:
+            return True
+        time.sleep(0.01)
+    return False
+# ---------------------------------------------------------
 
 # ---------- Camera thread for low-latency grabbing ----------
 class CameraThread:
@@ -47,7 +90,6 @@ class CameraThread:
 
     def update(self):
         while not self.stopped:
-            # drop queued frames to keep only the freshest one
             for _ in range(self.drop):
                 self.cap.grab()
             ok, f = self.cap.retrieve()
@@ -71,7 +113,7 @@ class CameraThread:
 def main():
     args = parse_args()
 
-    # tame BLAS/OMP & Torch threads (helps stability on small CPUs like RPi)
+    # threads for BLAS/Torch/OpenCV
     os.environ.setdefault('OMP_NUM_THREADS', str(args.torch_threads))
     os.environ.setdefault('OPENBLAS_NUM_THREADS', str(args.torch_threads))
     os.environ.setdefault('MKL_NUM_THREADS', str(args.torch_threads))
@@ -80,8 +122,6 @@ def main():
         torch.set_num_threads(args.torch_threads)
     except Exception:
         pass
-
-    # OpenCV threads (too many can hurt on small SoCs)
     try:
         cv2.setNumThreads(int(args.opencv_threads))
     except Exception:
@@ -91,9 +131,8 @@ def main():
     img_source  = args.source
     min_thresh  = float(args.thresh)
     user_res    = args.resolution
-    record      = args.record
     imgsz       = int(args.imgsz)
-    detect_every= max(1, int(args.detect-interval)) if hasattr(args, 'detect-interval') else max(1, int(args.detect_interval))
+    detect_every= max(1, int(args.detect_interval))
 
     if not os.path.exists(model_path):
         print('ERROR: invalid model path.')
@@ -105,11 +144,11 @@ def main():
     model = YOLO(model_path, task='detect')
     labels = model.names  # dict {id:name}
 
-    # (important) warmup once at target imgsz to avoid first-frame stall
-    _ = model.predict(np.zeros((imgsz, imgsz, 3), dtype=np.uint8), imgsz=imgsz,
-                      classes=KEEP_IDS, verbose=False)
+    # warmup once at target imgsz
+    _ = model.predict(np.zeros((imgsz, imgsz, 3), dtype=np.uint8),
+                      imgsz=imgsz, classes=KEEP_IDS, verbose=False)
 
-    # Detect source type
+    # Detect source type (more robust)
     img_ext_list = ['.jpg','.JPG','.jpeg','.JPEG','.png','.PNG','.bmp','.BMP']
     vid_ext_list = ['.avi','.mov','.mp4','.mkv','.wmv']
 
@@ -124,7 +163,14 @@ def main():
         else:
             print(f'Unsupported file extension: {ext}')
             sys.exit(0)
-    elif 'usb' in img_source:
+    elif img_source.isdigit():
+        source_type = 'usb'
+        usb_idx = int(img_source)
+    elif img_source.startswith('/dev/video'):
+        source_type = 'usb'
+        digits = ''.join([c for c in img_source if c.isdigit()])
+        usb_idx = int(digits) if digits else 0
+    elif img_source.startswith('usb'):
         source_type = 'usb'
         usb_idx = int(img_source[3:])  # usb0 -> 0
     elif 'picamera' in img_source:
@@ -140,18 +186,6 @@ def main():
         resize = True
         resW, resH = map(int, user_res.split('x'))
 
-    # Recording setup
-    if record:
-        if source_type not in ['video','usb']:
-            print('Recording only for video/usb sources.')
-            sys.exit(0)
-        if not user_res:
-            print('Please set --resolution to record.')
-            sys.exit(0)
-        record_name = 'demo1.avi'
-        record_fps = args.fps
-        recorder = cv2.VideoWriter(record_name, cv2.VideoWriter_fourcc(*'MJPG'), record_fps, (resW,resH))
-
     # Load/init source
     cam_thread = None
     if source_type == 'image':
@@ -164,21 +198,20 @@ def main():
             if file_ext in img_ext_list:
                 imgs_list.append(file)
 
-    elif source_type in ('video', 'usb'):
-        cap_arg = img_source if source_type == 'video' else usb_idx
-        backend = cv2.CAP_V4L2 if source_type == 'usb' else cv2.CAP_ANY
-        cap = cv2.VideoCapture(cap_arg, backend)
-
+    elif source_type == 'video':
+        cap = cv2.VideoCapture(img_source)
         if user_res:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  resW)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resH)
-        if args.fps:
-            cap.set(cv2.CAP_PROP_FPS, args.fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if args.mjpeg:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
+    elif source_type == 'usb':
+        cap = try_open_usb(usb_idx, resW if user_res else None,
+                           resH if user_res else None, args.fps, args.mjpeg)
         cam_thread = CameraThread(cap, drop=args.drop)
+        if not wait_first_frame(cam_thread, timeout_sec=3.0):
+            print("Camera opened but no frames within timeout. Try removing --mjpeg or use /dev/videoX.")
+            sys.exit(0)
 
     elif source_type == 'picamera':
         from picamera2 import Picamera2
@@ -220,18 +253,16 @@ def main():
             img_count += 1
 
         elif source_type == 'video':
-            frame = cam_thread.read() if cam_thread else None
-            if frame is None:
-                ret, frame = cap.read()
-                if not ret:
-                    print('Reached end of video. Exiting.')
-                    break
+            ret, frame = cap.read()
+            if not ret:
+                print('Reached end of video. Exiting.')
+                break
 
         elif source_type == 'usb':
             frame = cam_thread.read()
             if frame is None:
-                print('Unable to read from camera. Exiting.')
-                break
+                time.sleep(0.005)
+                continue
 
         elif source_type == 'picamera':
             frame_rgb = cap.capture_array()
@@ -245,7 +276,6 @@ def main():
 
         run_detect = (frame_idx % detect_every == 0)
         if run_detect:
-            # -------- Inference (limit 8 classes + reduced imgsz) --------
             results = model.predict(frame, imgsz=imgsz, classes=KEEP_IDS, verbose=False)
             det = results[0].boxes
 
@@ -253,7 +283,6 @@ def main():
                 boxes = det.xyxy.cpu().numpy().astype(int)
                 confs = det.conf.cpu().numpy()
                 clss  = det.cls.cpu().numpy().astype(int)
-
                 mask = (confs >= min_thresh) & np.isin(clss, KEEP_IDS)
                 last_boxes = boxes[mask]
                 last_confs = confs[mask]
@@ -280,22 +309,18 @@ def main():
             cv2.putText(frame, f'FPS: {avg_frame_rate:0.2f}',
                         (10,20), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
 
-        # Display
+        # Display only (no saving)
         if not args.nodraw:
             cv2.putText(frame, f'Objects (8 classes): {object_count}',
                         (10,40), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
-            cv2.imshow('YOLO (fast path, 8 classes)', frame)
+            cv2.imshow('YOLO realtime (8 classes)', frame)
 
-        if record and not args.nodraw:
-            recorder.write(frame)
-
+        # Keys: just quit/pause (no save)
         key = cv2.waitKey(1 if source_type in ('video','usb','picamera') else 0)
         if key in (ord('q'), ord('Q')):
             break
         elif key in (ord('s'), ord('S')):
             cv2.waitKey()
-        elif key in (ord('p'), ord('P')) and not args.nodraw:
-            cv2.imwrite('capture.png', frame)
 
         # FPS calc
         t_stop = time.perf_counter()
@@ -309,17 +334,17 @@ def main():
 
     # Clean up
     print(f'Average pipeline FPS: {avg_frame_rate:.2f}')
-    if source_type in ('video','usb'):
-        if cam_thread:
-            cam_thread.release()
-        try:
+    try:
+        if source_type == 'video':
             cap.release()
-        except Exception:
-            pass
-    elif source_type == 'picamera':
-        cap.stop()
-    if record:
-        recorder.release()
+        elif source_type == 'usb':
+            if cam_thread:
+                cam_thread.release()
+            cap.release()
+        elif source_type == 'picamera':
+            cap.stop()
+    except Exception:
+        pass
     cv2.destroyAllWindows()
 
 if __name__ == '__main__':
