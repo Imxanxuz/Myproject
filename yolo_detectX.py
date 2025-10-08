@@ -1,362 +1,306 @@
-import os
-import sys
-import glob
-import time
-import threading
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+
 
 import cv2
 import numpy as np
+import time
+from dataclasses import dataclass
 from ultralytics import YOLO
 
-# -------------------- Classes to keep (COCO) --------------------
-KEEP_IDS = [0, 1, 2, 3, 5, 9, 15, 16]
-# ---------------------------------------------------------------
+# CONFIGURATION
+GPIO_MODE = False     
+
+if GPIO_MODE:
+    import motors as mot
+    print("[GPIO MODE]  Motor control ENABLED")
+else:
+    print("[SIMULATION MODE]  Motor control DISABLED")
+
 
 @dataclass
 class Config:
-    model_path: str = "yolo11n.pt"
-    source: str = "0"
-    conf_thresh: float = 0.50
-    imgsz: int = 320
-    detect_interval: int = 1
-    drop_before_retrieve: int = 2
-
-    resolution: Optional[Tuple[int, int]] = (640, 480)
-    show_fps: bool = True
-    show_boxes: bool = True
-
-    request_fps: int = 30
-    force_mjpeg: bool = False
-
-    torch_threads: int = 2
-    opencv_threads: int = 1
+    model_path: str = "C:/SUN/Y4.1/Project/code/yolo11n.pt"
+    source: str = "0"                          
+    resolution: tuple = (640,640)
+    conf_thresh: float = 0.4
+    imgsz: int = 120
+    steering_gain: float = 0.02
+    max_angle: float = 30.0
+    roi_ratio: float = 0.6
+    canny_low: int = 75
+    canny_high: int = 150
+    focal_length: float = 700.0
+    normal_speed: int = 50
 
 
-class CameraThread:
-    def __init__(self, cap: cv2.VideoCapture, drop: int = 2):
-        self.cap = cap
-        self.drop = max(0, int(drop))
-        self.lock = threading.Lock()
-        self.frame = None
-        self.stopped = False
-        self.th = threading.Thread(target=self._update, daemon=True)
-        self.th.start()
+# LANE DETECTOR
+class LaneDetector:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.prev_lanes = []
 
-    def _update(self):
-        while not self.stopped:
-            for _ in range(self.drop):
-                self.cap.grab()
-            ok, f = self.cap.retrieve()
-            if not ok:
-                ok, f = self.cap.read()
-                if not ok:
-                    time.sleep(0.001)
-                    continue
-            with self.lock:
-                self.frame = f
+    def detect_lanes(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, self.cfg.canny_low, self.cfg.canny_high)
 
-    def read(self):
-        with self.lock:
-            return None if self.frame is None else self.frame.copy()
+        h, w = edges.shape
+        mask = np.zeros_like(edges)
+        pts = np.array([[(
+            int(w * 0.1), h),
+            (int(w * 0.4), int(h * self.cfg.roi_ratio)),
+            (int(w * 0.6), int(h * self.cfg.roi_ratio)),
+            (int(w * 0.9), h)
+        ]], np.int32)
+        cv2.fillPoly(mask, pts, 255)
+        roi = cv2.bitwise_and(edges, mask)
 
-    def release(self):
-        self.stopped = True
-        self.th.join(timeout=0.5)
+        lines = cv2.HoughLinesP(roi, 1, np.pi / 180, 30,
+                                minLineLength=40, maxLineGap=30)
+        if lines is None:
+            return self.prev_lanes
+
+        left, right = [], []
+        for x1, y1, x2, y2 in lines[:, 0]:
+            if x2 - x1 == 0:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            if abs(slope) < 0.4 or abs(slope) > 1.0:
+                continue
+            if slope < 0:
+                left.append((x1, y1, x2, y2))
+            else:
+                right.append((x1, y1, x2, y2))
+
+        lanes = []
+        if left:
+            avg_left = self._average_lines(left, h)
+            if avg_left is not None:
+                lanes.append(avg_left)
+        if right:
+            avg_right = self._average_lines(right, h)
+            if avg_right is not None:
+                lanes.append(avg_right)
+
+        if lanes:
+            self.prev_lanes = lanes
+        return lanes
+
+    def _average_lines(self, lines, height):
+        xs, ys = [], []
+        for x1, y1, x2, y2 in lines:
+            xs += [x1, x2]
+            ys += [y1, y2]
+        if len(xs) < 2:
+            return None
+        slope, intercept = np.polyfit(xs, ys, 1)
+        y1, y2 = height, int(height * self.cfg.roi_ratio)
+        x1, x2 = int((y1 - intercept) / slope), int((y2 - intercept) / slope)
+        return [x1, y1, x2, y2]
+
+    def draw_lanes(self, frame, lanes):
+        out = frame.copy()
+        for x1, y1, x2, y2 in lanes:
+            cv2.line(out, (x1, y1), (x2, y2), (0, 255, 255), 6)
+        return out
+
+    def get_lane_area_mask(self, shape, lanes):
+        mask = np.zeros(shape[:2], dtype=np.uint8)
+        if len(lanes) == 2:
+            pts = np.array([[(
+                lanes[0][0], lanes[0][1]),
+                (lanes[0][2], lanes[0][3]),
+                (lanes[1][2], lanes[1][3]),
+                (lanes[1][0], lanes[1][1])
+            ]], np.int32)
+            cv2.fillPoly(mask, pts, 255)
+        return mask
 
 
-def try_open_usb(name_or_idx: str, res: Optional[Tuple[int, int]], fps: int, force_mjpeg: bool) -> cv2.VideoCapture:
-    if name_or_idx.isdigit():
-        usb_idx = int(name_or_idx)
+# LANE KEEPER
+class LaneKeeper:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.angle = 0.0
+
+    @staticmethod
+    def _x_at_y(line, y_ref):
+        x1, y1, x2, y2 = line
+        if x2 == x1:
+            return x1
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 - slope * x1
+        return int((y_ref - intercept) / slope)
+
+    def calculate_steering(self, lanes, frame_shape):
+        h, w = frame_shape[:2]
+        if len(lanes) < 2:
+            return self.angle * self.cfg.max_angle, None, None
+
+        lanes_sorted = sorted(lanes, key=lambda x: x[0])
+        left, right = lanes_sorted[0], lanes_sorted[1]
+        y_ref = int(h * 0.9)
+        x_left = self._x_at_y(left, y_ref)
+        x_right = self._x_at_y(right, y_ref)
+        lane_center = int((x_left + x_right) / 2)
+        image_center = int(w / 2)
+
+        deviation = lane_center - image_center
+        offset_px = deviation
+        self.angle = np.clip(-deviation * self.cfg.steering_gain, -1, 1)
+        return self.angle * self.cfg.max_angle, offset_px, (lane_center, y_ref)
+
+
+# DISTANCE + SPEED FUNCTIONS
+def estimate_distance(cfg: Config, box_h: int, label: str) -> float:
+    real_height_map = {
+        "person": 1.7, "car": 1.5, "truck": 3.0, "motorcycle": 1.2, "bicycle": 1.5
+    }
+    real_h = real_height_map.get(label, 1.5)
+    if box_h <= 0:
+        return np.inf
+    return round((cfg.focal_length * real_h) / box_h, 2)
+
+
+def suggest_speed(distance: float, cfg: Config) -> int:
+    if distance < 3:
+        return 0
+    elif distance < 7:
+        return 15
+    elif distance < 15:
+        return 30
     else:
-        digits = "".join([c for c in name_or_idx if c.isdigit()])
-        usb_idx = int(digits) if digits else 0
-
-    attempts = [
-        (cv2.CAP_V4L2, 'MJPG') if force_mjpeg else (cv2.CAP_V4L2, None),
-        (cv2.CAP_V4L2, 'YUYV'),
-        (cv2.CAP_ANY,  'MJPG') if force_mjpeg else (cv2.CAP_ANY, None),
-        (cv2.CAP_ANY,  'YUYV'),
-        (cv2.CAP_ANY,  None),
-    ]
-    last_err = None
-
-    for backend, fourcc in attempts:
-        cap = cv2.VideoCapture(usb_idx, backend)
-        if not cap.isOpened():
-            cap.release()
-            last_err = f"cannot open (backend={backend})"
-            continue
-
-        if res is not None:
-            w, h = res
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  int(w))
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
-        if fps:
-            cap.set(cv2.CAP_PROP_FPS, int(fps))
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if fourcc == 'MJPG':
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        elif fourcc == 'YUYV':
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
-
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            return cap
-
-        last_err = f"opened but no frame (backend={backend}, fourcc={fourcc})"
-        cap.release()
-
-    raise RuntimeError(f"USB cam open failed: {last_err}")
+        return cfg.normal_speed
 
 
-def detect_source_type(src: str) -> str:
-    img_ext = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.BMP'}
-    vid_ext = {'.avi', '.mov', '.mp4', '.mkv', '.wmv', '.MP4', '.MOV'}
 
-    if os.path.isdir(src):
-        return 'folder'
-    if os.path.isfile(src):
-        _, ext = os.path.splitext(src)
-        if ext in img_ext:
-            return 'image'
-        if ext in vid_ext:
-            return 'video'
-        raise ValueError(f"Unsupported file extension: {ext}")
-
-    if src.isdigit() or src.startswith("/dev/video"):
-        return 'usb'
-
-    raise ValueError(f"Invalid source: {src}")
-
-
-def warmup_model(model: YOLO, imgsz: int):
-    dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
-    _ = model.predict(dummy, imgsz=imgsz, classes=KEEP_IDS, verbose=False)
-
-
-def put_text(img: np.ndarray, text: str, y: int):
-    cv2.putText(img, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-
-def draw_detections(img: np.ndarray, boxes: np.ndarray, confs: np.ndarray, clss: np.ndarray, labels, keep_ids: List[int]):
-    bbox_colors = [
-        (164,120, 87), ( 68,148,228), ( 93, 97,209), (178,182,133),
-        ( 88,159,106), ( 96,202,231), (159,124,168), (169,162,241),
-        ( 98,118,150), (172,176,184)
-    ]
-    for (xmin, ymin, xmax, ymax), c, k in zip(boxes, confs, clss):
-        color = bbox_colors[int(k) % len(bbox_colors)]
-        cv2.rectangle(img, (xmin, ymin), (xmax, ymax), color, 2)
-        name = labels[k] if isinstance(labels, dict) else str(labels[k])
-        text = f'{name} {int(c*100)}%'
-        cv2.putText(img, text, (xmin, max(15, ymin-6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-    cv2.putText(img, f'Objects (8 classes only): {len(boxes)}', (10, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-
+# MAIN
 def main(cfg: Config):
-    os.environ.setdefault('OMP_NUM_THREADS', str(cfg.torch_threads))
-    os.environ.setdefault('OPENBLAS_NUM_THREADS', str(cfg.torch_threads))
-    os.environ.setdefault('MKL_NUM_THREADS', str(cfg.torch_threads))
-    try:
-        import torch
-        torch.set_num_threads(cfg.torch_threads)
-    except Exception:
-        pass
-    try:
-        cv2.setNumThreads(int(cfg.opencv_threads))
-    except Exception:
-        pass
+    global GPIO_MODE
 
-    if not os.path.exists(cfg.model_path):
-        print(f'ERROR: model not found -> {cfg.model_path}')
-        sys.exit(1)
+    print("[INFO] Loading YOLO model...")
+    model = YOLO(cfg.model_path)
+    lane_detector = LaneDetector(cfg)
+    keeper = LaneKeeper(cfg)
 
-    model = YOLO(cfg.model_path, task='detect')
-    labels = model.names
-    warmup_model(model, cfg.imgsz)
+    cap = cv2.VideoCapture(int(cfg.source))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.resolution[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.resolution[1])
 
-    src_type = detect_source_type(cfg.source)
-
-    cam_thread = None
-    cap = None
-    img_list = []
-    resW, resH = (cfg.resolution if cfg.resolution else (None, None))
-    do_resize = cfg.resolution is not None
-
-    if src_type == 'image':
-        img_list = [cfg.source]
-    elif src_type == 'folder':
-        for p in glob.glob(os.path.join(cfg.source, '*')):
-            ext = os.path.splitext(p)[1].lower()
-            if ext in {'.jpg', '.jpeg', '.png', '.bmp'}:
-                img_list.append(p)
-        img_list.sort()
-    elif src_type == 'video':
-        cap = cv2.VideoCapture(cfg.source)
-        if do_resize:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  resW)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resH)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    elif src_type == 'usb':
-        cap = try_open_usb(cfg.source, cfg.resolution, cfg.request_fps, cfg.force_mjpeg)
-        cam_thread = CameraThread(cap, drop=cfg.drop_before_retrieve)
-
-    # caches
-    last_boxes = np.empty((0, 4), dtype=int)
-    last_confs = np.empty((0,), dtype=float)
-    last_clss  = np.empty((0,), dtype=int)
-    frame_idx = 0
-
-    # FPS collectors
-    loop_fps_hist: List[float] = []
-    det_fps_hist: List[float]  = []
-    fps_avg_len = 200
-
-    # ---- RealFPS (wall-clock) ----
-    real_frames = 0
-    real_start  = time.time()
-    realfps_update_period = 1.0  # sec
-    real_fps = 0.0
-
-    # print tracking every 1s
-    last_print_ts = time.time()
-    print_period = 1.0
+    frame_counter = 0
+    print("[INFO] Press 'G' to toggle GPIO mode, 'Q' to quit.")
 
     while True:
-        loop_t0 = time.perf_counter()
+        ret, frame = cap.read()
+        if not ret:
+            continue
 
-        # read frame
-        if src_type in ('image', 'folder'):
-            if frame_idx >= len(img_list):
-                print('All images processed. Exit.')
-                break
-            path = img_list[frame_idx]
-            frame = cv2.imread(path)
-            if frame is None:
-                frame_idx += 1
-                continue
-        elif src_type == 'video':
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                print('Video ended. Exit.')
-                break
-        else:  # usb
-            frame = cam_thread.read()
-            if frame is None:
-                time.sleep(0.005)
-                continue
+        frame_counter += 1
+        start_time = time.time()
 
-        if do_resize:
-            frame = cv2.resize(frame, (resW, resH))
+        lanes = lane_detector.detect_lanes(frame)
+        frame = lane_detector.draw_lanes(frame, lanes)
+        steering_angle, offset_px, lane_center_point = keeper.calculate_steering(lanes, frame.shape)
 
-        # detect at interval
-        run_detect = (frame_idx % max(1, cfg.detect_interval) == 0)
-        if run_detect:
-            det_t0 = time.perf_counter()
-            results = model.predict(frame, imgsz=cfg.imgsz, classes=KEEP_IDS, verbose=False)
-            det_t1 = time.perf_counter()
+        h, w = frame.shape[:2]
+        image_center = (w // 2, int(h * 0.9))
+        cv2.line(frame, (image_center[0], 0), (image_center[0], h), (255, 255, 255), 1)
+        cv2.circle(frame, image_center, 6, (255, 0, 0), -1)
+        if lane_center_point is not None:
+            cv2.circle(frame, lane_center_point, 6, (0, 255, 0), -1)
+            cv2.line(frame, image_center, lane_center_point, (0, 255, 0), 2)
 
-            det_dt = det_t1 - det_t0
-            det_fps = 1.0 / max(1e-6, det_dt)
-            det_fps_hist.append(det_fps)
-            if len(det_fps_hist) > fps_avg_len:
-                det_fps_hist.pop(0)
+        results = model.predict(frame, imgsz=cfg.imgsz, conf=cfg.conf_thresh, verbose=False)
+        det = results[0].boxes
+        lane_mask = lane_detector.get_lane_area_mask(frame.shape, lanes)
+        in_lane_objs, min_dist_in_lane = [], np.inf
 
-            det = results[0].boxes
-            if len(det) > 0:
-                boxes = det.xyxy.cpu().numpy().astype(int)
-                confs = det.conf.cpu().numpy()
-                clss  = det.cls.cpu().numpy().astype(int)
-                mask = (confs >= cfg.conf_thresh) & np.isin(clss, KEEP_IDS)
-                last_boxes = boxes[mask]
-                last_confs = confs[mask]
-                last_clss  = clss[mask]
+        for box in det:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            h_box = y2 - y1
+            label = model.names[int(box.cls[0])]
+            dist = estimate_distance(cfg, h_box, label)
+            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+            inside = lane_mask[cy, cx] == 255 if lanes else False
+            color = (0, 255, 0) if inside else (0, 0, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"{label} {dist:.1f}m", (x1, max(20, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            if inside:
+                in_lane_objs.append((label, dist))
+                min_dist_in_lane = min(min_dist_in_lane, dist)
+
+        suggested_speed = suggest_speed(min_dist_in_lane, cfg) if in_lane_objs else cfg.normal_speed
+        status = f"Object IN lane ({min_dist_in_lane:.1f} m)" if in_lane_objs else "No object in lane"
+
+        fps = 1.0 / (time.time() - start_time + 1e-6)
+
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"{status}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Speed: {suggested_speed} km/h", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 0) if suggested_speed > 0 else (0, 0, 255), 2)
+
+        mode_text = f"GPIO MODE: {'ON' if GPIO_MODE else 'OFF'}"
+        color = (0, 255, 0) if GPIO_MODE else (0, 0, 255)
+        cv2.putText(frame, mode_text, (10, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+
+        if offset_px is not None:
+            direction = "straight"
+            if GPIO_MODE and frame_counter % 10 == 0:
+                if -6 < offset_px < 6:
+                    mot.frontmiddle(); mot.forward(25)
+                    direction = "straight"
+                elif offset_px > 6:
+                    mot.frontleft(); mot.forward(25)
+                    direction = "turn right"
+                elif offset_px < -6:
+                    mot.frontright(); mot.forward(25)
+                    direction = "turn left"
+
+
+            pwm_status = mot.get_pwm_status() if GPIO_MODE else {"A": 0, "B": 0, "C": 0, "D": 0}
+            pwm_text = f"PWM A:{pwm_status['A']:.0f}%  B:{pwm_status['B']:.0f}%  C:{pwm_status['C']:.0f}%  D:{pwm_status['D']:.0f}%"
+            cv2.putText(frame, pwm_text, (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 180), 2)
+            cv2.putText(frame, f"Direction: {direction}", (10, 430),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            if frame_counter % 20 == 0 and GPIO_MODE:
+                print(f"[MOTOR] {direction} | {pwm_text}")
+
+            cv2.putText(frame, f"Steering: {steering_angle:.1f} degree ({direction})", (10, 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, f"Offset: {offset_px:+.1f}px", (10, 145),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2)
+        else:
+            cv2.putText(frame, "Steering: N/A (lanes not found)", (10, 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        cv2.imshow("YOLO + Lane + Speed + GPIO + PWM", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('g'):
+            GPIO_MODE = not GPIO_MODE
+            if GPIO_MODE:
+                print("[GPIO MODE] ✅ Motor control ENABLED")
             else:
-                last_boxes = np.empty((0, 4), dtype=int)
-                last_confs = np.empty((0,), dtype=float)
-                last_clss  = np.empty((0,), dtype=int)
+                print("[GPIO MODE] ❌ Motor control DISABLED")
+                if 'mot' in globals():
+                    mot.stop()
 
-        # draw
-        if cfg.show_boxes and len(last_boxes) > 0:
-            draw_detections(frame, last_boxes, last_confs, last_clss, labels, KEEP_IDS)
-
-        # ---- Loop FPS (whole pipeline loop) ----
-        loop_t1 = time.perf_counter()
-        loop_dt = loop_t1 - loop_t0
-        loop_fps = 1.0 / max(1e-6, loop_dt)
-        loop_fps_hist.append(loop_fps)
-        if len(loop_fps_hist) > fps_avg_len:
-            loop_fps_hist.pop(0)
-
-        # ---- RealFPS update (wall-clock) ----
-        real_frames += 1
-        elapsed = time.time() - real_start
-        if elapsed >= realfps_update_period:
-            real_fps = real_frames / max(1e-6, elapsed)
-            real_frames = 0
-            real_start = time.time()
-
-        # overlays
-        if cfg.show_fps:
-            det_fps_avg  = float(np.mean(det_fps_hist)) if det_fps_hist else 0.0
-            loop_fps_avg = float(np.mean(loop_fps_hist)) if loop_fps_hist else 0.0
-            put_text(frame, f'RealFPS (wall-clock): {real_fps:0.2f}', y=45)  # << NEW
-
-        cv2.imshow("YOLO realtime (8 classes, clean skeleton)", frame)
-
-        # print tracking every 1 second (uses last_boxes to be robust)
-        now_ts = time.time()
-        if now_ts - last_print_ts >= print_period:
-            print(f"tracking : {len(last_boxes)}")
-            last_print_ts = now_ts
-
-        key = cv2.waitKey(1 if src_type in ('video', 'usb') else 0)
-        if key in (ord('q'), ord('Q'), 27):
+        elif key in [ord('q'), 27]:
             break
-        elif key in (ord('p'), ord('P')) and src_type in ('video', 'usb'):
-            while True:
-                k2 = cv2.waitKey(0)
-                if k2 in (ord('p'), ord('P'), ord('q'), ord('Q'), 27):
-                    if k2 in (ord('q'), ord('Q'), 27):
-                        key = k2
-                    break
 
-        frame_idx += 1
-
-        if src_type in ('image', 'folder'):
-            if key in (ord('q'), ord('Q'), 27):
-                break
-
-    try:
-        if cap is not None and src_type in ('video', 'usb'):
-            if cam_thread:
-                cam_thread.release()
-            cap.release()
-    except Exception:
-        pass
+    cap.release()
     cv2.destroyAllWindows()
+    if GPIO_MODE:
+        mot.stop()
+    print("[INFO] Exited successfully.")
 
 
 if __name__ == "__main__":
-    cfg = Config(
-        model_path="yolo11n.pt",
-        source="0",
-        conf_thresh=0.50,
-        imgsz=320,
-        detect_interval=1,
-        drop_before_retrieve=2,
-        resolution=(720, 320),
-        show_fps=True,
-        show_boxes=True,
-        request_fps=30,
-        force_mjpeg=False,
-        torch_threads=2,
-        opencv_threads=1,
-    )
+    cfg = Config()
     main(cfg)
