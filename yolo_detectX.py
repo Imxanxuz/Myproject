@@ -22,7 +22,7 @@ else:
 
 @dataclass
 class Config:
-    model_path: str = "C:/SUN/Y4.1/Project/code/yolo11n.pt"
+    model_path: str = "ome/rpi/yolo/yolo11n.pt"
     source: str = "0"                          
     resolution: tuple = (640,640)
     conf_thresh: float = 0.4
