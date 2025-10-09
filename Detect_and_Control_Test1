@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import cv2
+import numpy as np
+import time
+from dataclasses import dataclass
+from ultralytics import YOLO
+from time import sleep
+import RPi.GPIO as GPIO
+
+# =======================================================
+# ⚙️ GPIO CONFIGURATION (Servo Motor Control)
+# =======================================================
+GPIO.setwarnings(False)
+GPIO_MODE = True  # ✅ เปลี่ยนเป็น False หากทดสอบแบบจำลอง (ไม่มีฮาร์ดแวร์)
+
+if GPIO_MODE:
+    SERVO_PIN_B = 19
+    SERVO_PIN_C = 13
+    PWM_FREQ = 50
+
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(SERVO_PIN_B, GPIO.OUT)
+    GPIO.setup(SERVO_PIN_C, GPIO.OUT)
+
+    servo_pwm1 = GPIO.PWM(SERVO_PIN_B, PWM_FREQ)
+    servo_pwm2 = GPIO.PWM(SERVO_PIN_C, PWM_FREQ)
+
+    servo_pwm1.start(0)
+    servo_pwm2.start(0)
+
+    print("[GPIO MODE] Motor control ENABLED")
+else:
+    servo_pwm1 = None
+    servo_pwm2 = None
+    print("[SIMULATION MODE] Motor control DISABLED")
+
+current_duty = 0
+current_angle = 90
+
+def angle_to_duty(angle: float) -> float:
+    """แปลงมุม 0–180° → duty cycle (2–12%)"""
+    return 2 + (angle / 18.0)
+
+def move_to(angle: float):
+    """หมุน servo ทั้งสองตัวไปยังมุม"""
+    global current_duty, current_angle
+    angle = np.clip(angle, 0,90) 
+    duty = angle_to_duty(angle)
+
+    if GPIO_MODE:
+        servo_pwm1.ChangeDutyCycle(duty)
+        servo_pwm2.ChangeDutyCycle(duty)
+    print(f"[SERVO] Angle={angle:.1f}° Duty={duty:.2f}%")
+    current_angle = angle
+    current_duty = duty
+    sleep(0.05)
+    if GPIO_MODE:
+        servo_pwm1.ChangeDutyCycle(0)
+        servo_pwm2.ChangeDutyCycle(0)
+
+def stop_servo():
+    """Stop all PWM"""
+    if GPIO_MODE:
+        servo_pwm1.stop()
+        servo_pwm2.stop()
+        GPIO.cleanup()
+    print("[GPIO] Cleaned up")
+
+# =======================================================
+# ⚙️ CONFIGURATION PARAMETERS
+# =======================================================
+@dataclass
+class Config:
+    model_path: str = "/home/rpi/yolo/yolo11n.pt"
+    source: str = "0"
+    resolution: tuple = (640, 480)
+    conf_thresh: float = 0.4
+    imgsz: int = 320
+    steering_gain: float = 0.04     # ค่าความไวในการบังคับ (0.02–0.06)
+    max_angle: float = 30.0         # มุมสูงสุดที่ servo จะหมุน (°)
+    roi_ratio: float = 0.6
+    canny_low: int = 75
+    canny_high: int = 150
+    focal_length: float = 700.0
+    normal_speed: int = 50
+
+# =======================================================
+# 🛣️ LANE DETECTION CLASS
+# =======================================================
+class LaneDetector:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.prev_lanes = []
+
+    def detect_lanes(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, self.cfg.canny_low, self.cfg.canny_high)
+
+        h, w = edges.shape
+        mask = np.zeros_like(edges)
+        pts = np.array([[
+            (int(w * 0.1), h),
+            (int(w * 0.4), int(h * self.cfg.roi_ratio)),
+            (int(w * 0.6), int(h * self.cfg.roi_ratio)),
+            (int(w * 0.9), h)
+        ]], np.int32)
+        cv2.fillPoly(mask, pts, 255)
+        roi = cv2.bitwise_and(edges, mask)
+
+        lines = cv2.HoughLinesP(roi, 1, np.pi / 180, 30, minLineLength=40, maxLineGap=30)
+        if lines is None:
+            return self.prev_lanes
+
+        left, right = [], []
+        for x1, y1, x2, y2 in lines[:, 0]:
+            if x2 - x1 == 0:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            if abs(slope) < 0.4 or abs(slope) > 1.0:
+                continue
+            if slope < 0:
+                left.append((x1, y1, x2, y2))
+            else:
+                right.append((x1, y1, x2, y2))
+
+        lanes = []
+        if left:
+            lanes.append(self._average_line(left, h))
+        if right:
+            lanes.append(self._average_line(right, h))
+
+        if lanes:
+            self.prev_lanes = lanes
+        return lanes
+
+    def _average_line(self, lines, height):
+        xs, ys = [], []
+        for x1, y1, x2, y2 in lines:
+            xs += [x1, x2]
+            ys += [y1, y2]
+        if len(xs) < 2:
+            return None
+        slope, intercept = np.polyfit(xs, ys, 1)
+        y1, y2 = height, int(height * 0.6)
+        x1, x2 = int((y1 - intercept) / slope), int((y2 - intercept) / slope)
+        return [x1, y1, x2, y2]
+
+# =======================================================
+# 🤖 LANE KEEPER – คำนวณการเบี่ยงเบน
+# =======================================================
+class LaneKeeper:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.angle = 0.0
+
+    @staticmethod
+    def _x_at_y(line, y_ref):
+        x1, y1, x2, y2 = line
+        if x2 == x1:
+            return x1
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 - slope * x1
+        return int((y_ref - intercept) / slope)
+
+    def calculate_steering(self, lanes, frame_shape):
+        h, w = frame_shape[:2]
+        if len(lanes) < 2:
+            return None, None, None
+
+        lanes_sorted = sorted(lanes, key=lambda x: x[0])
+        left, right = lanes_sorted[0], lanes_sorted[1]
+        y_ref = int(h * 0.9)
+        x_left = self._x_at_y(left, y_ref)
+        x_right = self._x_at_y(right, y_ref)
+        lane_center = int((x_left + x_right) / 2)
+        image_center = int(w / 2)
+
+        deviation = lane_center - image_center
+        steering_angle = np.clip(-deviation * self.cfg.steering_gain, -1, 1)
+        steering_deg = steering_angle * self.cfg.max_angle
+        return steering_deg, deviation, (lane_center, y_ref)
+
+# =======================================================
+# 🚘 MAIN LOOP
+# =======================================================
+def main(cfg: Config):
+    print("[INFO] Loading YOLO model...")
+    model = YOLO(cfg.model_path)
+    lane_detector = LaneDetector(cfg)
+    keeper = LaneKeeper(cfg)
+
+    cap = cv2.VideoCapture(int(cfg.source))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.resolution[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.resolution[1])
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        start = time.time()
+        lanes = lane_detector.detect_lanes(frame)
+        steering_angle, offset_px, lane_center = keeper.calculate_steering(lanes, frame.shape)
+
+        # --- แสดงเส้นและค่าการเบี่ยงเบน ---
+        h, w = frame.shape[:2]
+        image_center = (w // 2, int(h * 0.9))
+        cv2.line(frame, (image_center[0], 0), (image_center[0], h), (255, 255, 255), 1)
+        if lane_center:
+            cv2.circle(frame, lane_center, 6, (0, 255, 0), -1)
+            cv2.line(frame, image_center, lane_center, (0, 255, 0), 2)
+
+        if steering_angle is not None:
+            target_angle = 90 + steering_angle  # 90° คือจุดตรงกลาง
+            move_to(target_angle)
+
+            direction = (
+                "LEFT" if steering_angle < -2 else
+                "RIGHT" if steering_angle > 2 else
+                "STRAIGHT"
+            )
+            cv2.putText(frame, f"Offset: {offset_px:+.1f}px", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, f"Steering: {target_angle:.1f}° ({direction})", (10, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 180), 2)
+
+        fps = 1.0 / (time.time() - start + 1e-6)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.imshow("Lane Keeping with Servo Steering", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in [ord('q'), 27]:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    stop_servo()
+
+# =======================================================
+# 🚀 EXECUTION
+# =======================================================
+if __name__ == "__main__":
+    try:
+        cfg = Config()
+        main(cfg)
+    except KeyboardInterrupt:
+        stop_servo()
