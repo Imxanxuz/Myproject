@@ -26,11 +26,11 @@ if GPIO_MODE:
     servo_pwm2 = GPIO.PWM(SERVO_PIN_C, PWM_FREQ)
     servo_pwm1.start(0)
     servo_pwm2.start(0)
-    print("[GPIO MODE] ✅ Motor control ENABLED")
+    print("[GPIO MODE] Motor control ENABLED")
 else:
     servo_pwm1 = None
     servo_pwm2 = None
-    print("[SIMULATION MODE] ❌ Motor control DISABLED")
+    print("[SIMULATION MODE] Motor control DISABLED")
 
 current_duty = 0
 current_angle = 90
@@ -82,7 +82,7 @@ class Config:
     normal_speed: int = 50  # km/h (จำลอง)
 
 # =======================================================
-# 🛣️ LANE DETECTOR
+# LANE DETECTOR
 # =======================================================
 class LaneDetector:
     def __init__(self, cfg: Config):
@@ -157,7 +157,7 @@ class LaneDetector:
         return mask
 
 # =======================================================
-# 🧭 LANE KEEPER
+# LANE KEEPER
 # =======================================================
 class LaneKeeper:
     def __init__(self, cfg: Config):
@@ -188,7 +188,7 @@ class LaneKeeper:
         return steering_deg, deviation, (lane_center, y_ref)
 
 # =======================================================
-# 🧮 DISTANCE + SPEED
+# DISTANCE + SPEED
 # =======================================================
 def estimate_distance(cfg, box_h, label):
     real_height_map = {"person": 1.7, "car": 1.5, "truck": 3.0,
@@ -204,7 +204,7 @@ def suggest_speed(distance, cfg):
     else: return cfg.normal_speed
 
 # =======================================================
-# 🚘 MAIN LOOP
+# MAIN LOOP
 # =======================================================
 def main(cfg: Config):
     print("[INFO] Loading YOLO model...")
@@ -273,7 +273,7 @@ def main(cfg: Config):
     stop_servo()
 
 # =======================================================
-# 🚀 EXECUTION
+# EXECUTION
 # =======================================================
 if __name__ == "__main__":
     try:
