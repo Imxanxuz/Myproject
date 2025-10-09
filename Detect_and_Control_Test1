@@ -9,25 +9,20 @@ from ultralytics import YOLO
 from time import sleep
 import RPi.GPIO as GPIO
 
-# GPIO CONFIGURATION (Servo Motor Control)
 GPIO.setwarnings(False)
-GPIO_MODE = True  
+GPIO_MODE = True
 
 if GPIO_MODE:
     SERVO_PIN_B = 19
     SERVO_PIN_C = 13
     PWM_FREQ = 50
-
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(SERVO_PIN_B, GPIO.OUT)
     GPIO.setup(SERVO_PIN_C, GPIO.OUT)
-
     servo_pwm1 = GPIO.PWM(SERVO_PIN_B, PWM_FREQ)
     servo_pwm2 = GPIO.PWM(SERVO_PIN_C, PWM_FREQ)
-
     servo_pwm1.start(0)
     servo_pwm2.start(0)
-
     print("[GPIO MODE] Motor control ENABLED")
 else:
     servo_pwm1 = None
@@ -35,55 +30,49 @@ else:
     print("[SIMULATION MODE] Motor control DISABLED")
 
 current_duty = 0
-current_angle = 90
+current_angle = 0
 
 def angle_to_duty(angle: float) -> float:
-    """แปลงมุม 0–180° → duty cycle (2–12%)"""
-    return 2 + (angle / 18.0)
+    return 7.5 + current_angle
 
 def move_to(angle: float):
-    """หมุน servo ทั้งสองตัวไปยังมุม"""
     global current_duty, current_angle
-    angle = np.clip(angle, 0, 90)  # จำกัดมุมไม่ให้เกินช่วง servo
+    angle = np.clip(angle, 0.0,30)
     duty = angle_to_duty(angle)
-
     if GPIO_MODE:
         servo_pwm1.ChangeDutyCycle(duty)
         servo_pwm2.ChangeDutyCycle(duty)
     print(f"[SERVO] Angle={angle:.1f}° Duty={duty:.2f}%")
     current_angle = angle
     current_duty = duty
-    sleep(0.05)
+    # a shorter dwell time might help performance
+    sleep(0.01)
     if GPIO_MODE:
         servo_pwm1.ChangeDutyCycle(0)
         servo_pwm2.ChangeDutyCycle(0)
 
 def stop_servo():
-    """หยุด PWM ทั้งหมด"""
     if GPIO_MODE:
         servo_pwm1.stop()
         servo_pwm2.stop()
         GPIO.cleanup()
-    print("[GPIO]Cleaned up")
+    print("[GPIO] Cleaned up")
 
-
-# CONFIGURATION PARAMETERS
 @dataclass
 class Config:
     model_path: str = "/home/rpi/yolo/yolo11n.pt"
     source: str = "0"
-    resolution: tuple = (480, 480)
-    conf_thresh: float = 0.3
+    resolution: tuple = (640, 420)
+    conf_thresh: float = 0.5
     imgsz: int = 256
-    steering_gain: float = 0.02     # ค่าความไวในการบังคับ (0.02–0.06)
-    max_angle: float = 30.0         # มุมสูงสุดที่ servo จะหมุน (°)
-    roi_ratio: float = 0.6
+    steering_gain: float = 0.01
+    max_angle: float = 30.0
+    roi_ratio: float = 0.8
     canny_low: int = 75
     canny_high: int = 150
     focal_length: float = 700.0
-    normal_speed: int = 50
+    normal_speed: int = 25
 
-# LANE DETECTOR
 class LaneDetector:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -96,8 +85,8 @@ class LaneDetector:
 
         h, w = edges.shape
         mask = np.zeros_like(edges)
-        pts = np.array([[(
-            int(w * 0.1), h),
+        pts = np.array([[
+            (int(w * 0.1), h),
             (int(w * 0.4), int(h * self.cfg.roi_ratio)),
             (int(w * 0.6), int(h * self.cfg.roi_ratio)),
             (int(w * 0.9), h)
@@ -106,13 +95,13 @@ class LaneDetector:
         roi = cv2.bitwise_and(edges, mask)
 
         lines = cv2.HoughLinesP(roi, 1, np.pi / 180, 30,
-                                minLineLength=40, maxLineGap=30)
+                                minLineLength=30, maxLineGap=60)
         if lines is None:
             return self.prev_lanes
 
         left, right = [], []
         for x1, y1, x2, y2 in lines[:, 0]:
-            if x2 - x1 == 0:
+            if x2 == x1:
                 continue
             slope = (y2 - y1) / (x2 - x1)
             if abs(slope) < 0.4 or abs(slope) > 1.0:
@@ -124,13 +113,13 @@ class LaneDetector:
 
         lanes = []
         if left:
-            avg_left = self._average_lines(left, h)
-            if avg_left is not None:
-                lanes.append(avg_left)
+            avg_l = self._average_lines(left, h)
+            if avg_l is not None:
+                lanes.append(avg_l)
         if right:
-            avg_right = self._average_lines(right, h)
-            if avg_right is not None:
-                lanes.append(avg_right)
+            avg_r = self._average_lines(right, h)
+            if avg_r is not None:
+                lanes.append(avg_r)
 
         if lanes:
             self.prev_lanes = lanes
@@ -139,34 +128,40 @@ class LaneDetector:
     def _average_lines(self, lines, height):
         xs, ys = [], []
         for x1, y1, x2, y2 in lines:
-            xs += [x1, x2]
-            ys += [y1, y2]
+            xs.extend([x1, x2])
+            ys.extend([y1, y2])
         if len(xs) < 2:
             return None
         slope, intercept = np.polyfit(xs, ys, 1)
-        y1, y2 = height, int(height * self.cfg.roi_ratio)
-        x1, x2 = int((y1 - intercept) / slope), int((y2 - intercept) / slope)
-        return [x1, y1, x2, y2]
+        y1 = height
+        y2 = int(height * self.cfg.roi_ratio)
+        x1 = int((y1 - intercept) / slope)
+        x2 = int((y2 - intercept) / slope)
+        return (x1, y1, x2, y2)
 
     def draw_lanes(self, frame, lanes):
-        out = frame.copy()
-        for x1, y1, x2, y2 in lanes:
-            cv2.line(out, (x1, y1), (x2, y2), (0, 255, 255), 6)
+        out = frame
+        for (x1, y1, x2, y2) in lanes:
+            cv2.line(out, (x1, y1), (x2, y2), (0, 255, 255), 4)
         return out
 
     def get_lane_area_mask(self, shape, lanes):
+        """
+        Create a binary mask where the area between two detected lane lines is filled with white (255),
+        and the rest is black (0).
+        """
+        if len(lanes) != 2:
+            return np.zeros(shape[:2], dtype=np.uint8)
+
+        # Use numpy directly for efficiency
+        points = np.array([
+            [lanes[0][:2], lanes[0][2:], lanes[1][2:], lanes[1][:2]]
+        ], dtype=np.int32)
+
         mask = np.zeros(shape[:2], dtype=np.uint8)
-        if len(lanes) == 2:
-            pts = np.array([[(
-                lanes[0][0], lanes[0][1]),
-                (lanes[0][2], lanes[0][3]),
-                (lanes[1][2], lanes[1][3]),
-                (lanes[1][0], lanes[1][1])
-            ]], np.int32)
-            cv2.fillPoly(mask, pts, 255)
+        cv2.fillPoly(mask, points, 255)
         return mask
 
-# LANE KEEPER
 class LaneKeeper:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -186,42 +181,29 @@ class LaneKeeper:
         if len(lanes) < 2:
             return self.angle * self.cfg.max_angle, None, None
 
-        lanes_sorted = sorted(lanes, key=lambda x: x[0])
+        lanes_sorted = sorted(lanes, key=lambda ln: ln[0])
         left, right = lanes_sorted[0], lanes_sorted[1]
         y_ref = int(h * 0.9)
         x_left = self._x_at_y(left, y_ref)
         x_right = self._x_at_y(right, y_ref)
-        lane_center = int((x_left + x_right) / 2)
-        image_center = int(w / 2)
-
+        lane_center = (x_left + x_right) // 2
+        image_center = w // 2
         deviation = lane_center - image_center
-        offset_px = deviation
-        self.angle = np.clip(-deviation * self.cfg.steering_gain, -1, 1)
-        return self.angle * self.cfg.max_angle, offset_px, (lane_center, y_ref)
+        self.angle = np.clip(-deviation * self.cfg.steering_gain, -1.0, 1.0)
+        steering_angle = self.angle * self.cfg.max_angle
+        return steering_angle, deviation, (lane_center, y_ref)
 
-
-# DISTANCE + SPEED FUNCTIONS
 def estimate_distance(cfg: Config, box_h: int, label: str) -> float:
     real_height_map = {
         "person": 1.7, "car": 1.5, "truck": 3.0, "motorcycle": 1.2, "bicycle": 1.5
     }
     real_h = real_height_map.get(label, 1.5)
     if box_h <= 0:
-        return np.inf
-    return round((cfg.focal_length * real_h) / box_h, 2)
+        return float("inf")
+    return (cfg.focal_length * real_h) / box_h
 
 
-def suggest_speed(distance: float, cfg: Config) -> int:
-    if distance < 3:
-        return 0
-    elif distance < 7:
-        return 15
-    elif distance < 15:
-        return 30
-    else:
-        return cfg.normal_speed
 
-# MAIN LOOP
 def main(cfg: Config):
     print("[INFO] Loading YOLO model...")
     model = YOLO(cfg.model_path)
@@ -233,92 +215,118 @@ def main(cfg: Config):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.resolution[1])
 
     frame_counter = 0
-    print("[INFO] 'Q' to quit.")
+    print("[INFO] 'Q' or ESC to quit.")
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            time.sleep(0.01)
             continue
-            
-        frame_counter += 1
-        start_time = time.time()
 
-        start = time.time()
+        frame_counter += 1
+        t0 = time.time()
+
+        # Lane detection
         lanes = lane_detector.detect_lanes(frame)
         frame = lane_detector.draw_lanes(frame, lanes)
+
         steering_angle, offset_px, lane_center = keeper.calculate_steering(lanes, frame.shape)
 
-        # --- แสดงเส้นและค่าการเบี่ยงเบน ---
+        # Draw reference lines / center
         h, w = frame.shape[:2]
         image_center = (w // 2, int(h * 0.9))
         cv2.line(frame, (image_center[0], 0), (image_center[0], h), (255, 255, 255), 1)
         cv2.circle(frame, image_center, 6, (255, 0, 0), -1)
-        if lane_center:
+        if lane_center is not None:
+            cv2.putText(frame, f"Speed: {cfg.normal_speed} km/h", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 255, 0) if cfg.normal_speed > 0 else (0, 0, 255), 2)
             cv2.circle(frame, lane_center, 6, (0, 255, 0), -1)
             cv2.line(frame, image_center, lane_center, (0, 255, 0), 2)
 
+        # Object detection (you could skip some frames if performance is low)
         results = model.predict(frame, imgsz=cfg.imgsz, conf=cfg.conf_thresh, verbose=False)
         det = results[0].boxes
         lane_mask = lane_detector.get_lane_area_mask(frame.shape, lanes)
-        in_lane_objs, min_dist_in_lane = [], np.inf
+
+        in_lane_objs = []
+        min_dist_in_lane = float("inf")
+
+        # Overlay lane mask lightly (visual shading)
+        if lanes:
+            colored_mask = cv2.merge([lane_mask] * 3)
+            frame = cv2.addWeighted(frame, 1.0, colored_mask, 0.2, 0)
 
         for box in det:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             h_box = y2 - y1
             label = model.names[int(box.cls[0])]
             dist = estimate_distance(cfg, h_box, label)
-            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-            inside = lane_mask[cy, cx] == 255 if lanes else False
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            inside = False
+            if lanes:
+                # safety: ensure cy, cx in bounds
+                cy_clamped = min(max(cy, 0), lane_mask.shape[0] - 1)
+                cx_clamped = min(max(cx, 0), lane_mask.shape[1] - 1)
+                inside = (lane_mask[cy_clamped, cx_clamped] == 255)
+
+
             color = (0, 255, 0) if inside else (0, 0, 255)
+            position = "IN" if inside else "OUT"
+
+            # Draw box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f"{label} {dist:.1f}m", (x1, max(20, y1 - 5)),
+            # Label with distance + IN/OUT
+            cv2.putText(frame, f"{label} {dist:.1f}m ({position})", (x1, max(y1 - 5, 0)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # Mark center
+            cv2.circle(frame, (cx, cy), 5, color, -1)
+
+            # Line from object to lane center
+            if lane_center is not None:
+                cv2.line(frame, (cx, cy), lane_center, color, 1)
+
             if inside:
                 in_lane_objs.append((label, dist))
-                min_dist_in_lane = min(min_dist_in_lane, dist)
+                if dist < min_dist_in_lane:
+                    min_dist_in_lane = dist
 
-        suggested_speed = suggest_speed(min_dist_in_lane, cfg) if in_lane_objs else cfg.normal_speed
-        status = f"Object IN lane ({min_dist_in_lane:.1f} m)" if in_lane_objs else "No object in lane"
 
-        fps = 1.0 / (time.time() - start_time + 1e-6)
+        status = (f"Object IN lane ({min_dist_in_lane:.1f} m)" if in_lane_objs
+                  else "No object in lane")
 
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"{status}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(frame, f"Speed: {suggested_speed} km/h", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, 255, 0) if suggested_speed > 0 else (0, 0, 255), 2)
+        fps = 1.0 / (time.time() - t0 + 1e-9)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, status, (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         mode_text = f"GPIO MODE: {'ON' if GPIO_MODE else 'OFF'}"
-        color = (0, 255, 0) if GPIO_MODE else (0, 0, 255)
-        cv2.putText(frame, mode_text, (10, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        mode_color = (0, 255, 0) if GPIO_MODE else (0, 0, 255)
+        cv2.putText(frame, mode_text, (10, 175),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
 
         if steering_angle is not None:
             direction = "straight"
+            if steering_angle > 10:
+                direction = "right"
+            elif steering_angle < -10:
+                direction = "left"
             move_to(steering_angle)
-            if GPIO_MODE and frame_counter % 10 == 0:
-                if -10 < steering_angle< 10:
-                    direction = "straight"
-                elif steering_angle> 10:
-                    direction = "tright"
-                elif steering_angle < -10:
-                    direction = "left"
-                    
-            cv2.putText(frame, f"Steering: {steering_angle:.1f} degree ({direction})", (10, 120),
+            cv2.putText(frame, f"Steering: {steering_angle:.1f}° ({direction})", (10, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         else:
-            cv2.putText(frame, "Steering: N/A (lanes not found)", (10, 120),
+            cv2.putText(frame, "Steering: N/A (no lanes)", (10, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                        
-        cv2.imshow("Lane Keeping with Servo Steering", frame)
 
+        cv2.imshow("Lane + Object View", frame)
         key = cv2.waitKey(1) & 0xFF
-        if key in [ord('q'), 27]:
+        if key in (ord('q'), 27):
             break
 
     cap.release()
     cv2.destroyAllWindows()
     stop_servo()
 
-# EXECUTION
 if __name__ == "__main__":
     try:
         cfg = Config()
