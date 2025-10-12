@@ -1,10 +1,10 @@
-#!/usr/st/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import cv2
 import numpy as np
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ultralytics import YOLO
 import RPi.GPIO as GPIO
 from collections import deque, Counter
@@ -18,21 +18,37 @@ GPIO_MODE = True
 @dataclass
 class Config:
     model_path: str = "/home/rpi/yolo/yolo11n.pt"
-    source: int = 0
-    resolution: tuple = (640,480)
-    conf_thresh: float = 0.2
-    imgsz: int = 226
+    source: any = 0
+    resolution: tuple = (640, 480)
+    
+    # [OPTIMIZED] เพิ่มค่า conf_thresh เพื่อกรองผลลัพธ์ที่ไม่ชัดเจนออกไปเร็วขึ้น
+    conf_thresh: float = 0.12
+    
+    # [OPTIMIZED] ลดขนาด imgsz ลงอย่างมาก ซึ่งเป็นวิธีที่ได้ผลที่สุดในการเพิ่ม FPS
+    # คุณสามารถทดลองปรับค่านี้ได้ระหว่าง 160, 192, 224 เพื่อหาจุดสมดุลระหว่างความเร็วและความแม่นยำ
+    imgsz: int = 256
+    
     steering_gain: float = 0.02
     max_angle: float = 30.0
     roi_top_ratio: float = 0.5
     canny_low: int = 50
     canny_high: int = 150
-    focal_length: float = 700.0
+    focal_length: float = 1500.0
     normal_speed: int = 30
-    # --- [NEW] Maximum detection distance in meters ---
-    max_detection_dist_m: float = 25
+    detection_distance_m: float = 75.0
+    lane_origin_y_ratio: float = 0.75
+    
+    TARGET_CLASSES: list = field(default_factory=lambda: ["person", "car", "truck", "bus", "bicycle", "motorcycle"])
+    
+    # --- Calibration & Tuning ---
+    LANE_DIST_CALIB_M: tuple = (3, 80)
+    lane_mask_margin: int = 15
+    OBJECT_REAL_HEIGHTS: dict = field(default_factory=lambda: {
+        "person": 1.7, "car": 1.5, "truck": 3.5, "bus": 3.2, "bicycle": 1.0, "motorcycle": 1.2
+    })
+    DEFAULT_OBJECT_HEIGHT: float = 1.5
 
-# --- MotorControl Class (Unchanged) ---
+# --- MotorControl Class ---
 class MotorControl:
     def __init__(self, pin_b, pin_c, freq=50):
         self.pin_b = pin_b
@@ -72,12 +88,18 @@ class MotorControl:
             self.servo_pwm2.stop()
             GPIO.cleanup()
 
-# --- LaneDetector and LaneKeeper Classes (Unchanged) ---
+# --- LaneDetector Class ---
 class LaneDetector:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.left_lanes = deque(maxlen=10)
         self.right_lanes = deque(maxlen=10)
+
+    def meters_to_y(self, meters: float, height: int) -> int:
+        m_near, m_far = self.cfg.LANE_DIST_CALIB_M
+        y_near, y_far = height, int(height * self.cfg.roi_top_ratio)
+        y_coord = np.interp(meters, [m_near, m_far], [y_near, y_far])
+        return int(np.clip(y_coord, y_far, y_near))
 
     def _average_lines(self, lines, height):
         if not lines: return None
@@ -87,8 +109,10 @@ class LaneDetector:
         slope = (y2 - y1) / (x2 - x1)
         if slope == 0: return None
         intercept = y1 - slope * x1
-        y1_new = int(height * 0.9)
-        y2_new = int(height * 0.65)
+        
+        y1_new = int(height * self.cfg.lane_origin_y_ratio)
+        y2_new = self.meters_to_y(self.cfg.detection_distance_m, height)
+        
         x1_new = int((y1_new - intercept) / slope)
         x2_new = int((y2_new - intercept) / slope)
         return (x1_new, y1_new, x2_new, y2_new)
@@ -132,10 +156,14 @@ class LaneDetector:
         if len(lanes) != 2: return np.zeros(shape[:2], dtype=np.uint8)
         mask = np.zeros(shape[:2], dtype=np.uint8)
         left_line, right_line = sorted(lanes, key=lambda line: line[0])
-        points = np.array([left_line[:2], left_line[2:], right_line[2:], right_line[:2]], dtype=np.int32)
+        margin = self.cfg.lane_mask_margin
+        lx1, ly1, lx2, ly2 = left_line
+        rx1, ry1, rx2, ry2 = right_line
+        points = np.array([[lx1 - margin, ly1], [lx2 - margin, ly2], [rx2 + margin, ry2], [rx1 + margin, ry1]], dtype=np.int32)
         cv2.fillPoly(mask, [points], 255)
         return mask
 
+# --- LaneKeeper Class ---
 class LaneKeeper:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -151,7 +179,7 @@ class LaneKeeper:
         h, w = frame_shape[:2]
         if len(lanes) < 2: return 0.0, None, None
         left, right = sorted(lanes, key=lambda ln: ln[0])
-        y_ref = int(h * 0.9)
+        y_ref = int(h * self.cfg.lane_origin_y_ratio)
         x_left = self._x_at_y(left, y_ref)
         x_right = self._x_at_y(right, y_ref)
         lane_center = (x_left + x_right) // 2
@@ -161,28 +189,35 @@ class LaneKeeper:
         self.angle_history.append(steering_angle)
         return np.mean(self.angle_history), deviation, (lane_center, y_ref)
 
-# --- YOLO Worker & Helper Functions (Unchanged) ---
-def estimate_distance(cfg: Config, box_h: int) -> float:
+# --- Helper Functions ---
+def estimate_distance(cfg: Config, box_h: int, label: str) -> float:
     if box_h <= 0: return float("inf")
-    return (cfg.focal_length * 1.5) / box_h
+    real_height = cfg.OBJECT_REAL_HEIGHTS.get(label, cfg.DEFAULT_OBJECT_HEIGHT)
+    distance = (cfg.focal_length * real_height) / box_h
+    return distance
 
 def yolo_worker(cfg, frame_queue, results_queue, stop_event):
     print("[INFO] YOLO worker thread started.")
     model = YOLO(cfg.model_path)
+    all_class_names = model.names
+    target_class_ids = [k for k, v in all_class_names.items() if v in cfg.TARGET_CLASSES]
+    print(f"[INFO] YOLO worker will only detect the following classes: {cfg.TARGET_CLASSES}")
+
     while not stop_event.is_set():
         try:
             frame = frame_queue.get(timeout=1)
             if frame is None: break
-            
-            # --- [MODIFIED] Time the prediction ---
             t_start = time.time()
-            results = model.predict(frame, imgsz=cfg.imgsz, conf=cfg.conf_thresh, verbose=False)
+            results = model.predict(
+                frame,
+                imgsz=cfg.imgsz,
+                conf=cfg.conf_thresh,
+                verbose=False,
+                classes=target_class_ids
+            )
             processing_time = time.time() - t_start
-            
             if results_queue.empty():
-                # --- [MODIFIED] Put both results and time in the queue ---
                 results_queue.put((results, processing_time))
-
         except Empty:
             continue
         except Exception as e:
@@ -192,46 +227,39 @@ def yolo_worker(cfg, frame_queue, results_queue, stop_event):
 
 # --- Main Application ---
 def main(cfg: Config):
-    # --- Setup ---
     lane_detector = LaneDetector(cfg)
     keeper = LaneKeeper(cfg)
     motor = MotorControl(pin_b=19, pin_c=13)
+    
     cap = cv2.VideoCapture(cfg.source)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open video source: {cfg.source}")
+        return
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.resolution[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.resolution[1])
-    
-    # --- Multithreading Setup ---
+
     frame_queue = Queue(maxsize=1)
     results_queue = Queue(maxsize=1)
     stop_event = threading.Event()
     yolo_thread = threading.Thread(target=yolo_worker, args=(cfg, frame_queue, results_queue, stop_event))
     yolo_thread.start()
 
-    # --- [MODIFIED] State Variables with new FPS counters ---
     lane_detection_enabled = False
     motor_enable = False
     last_known_boxes = []
     frame_counter = 0
-    lane_fps, yolo_fps = 0, 0 # Initialize FPS counters
+    lane_fps, yolo_fps = 0, 0
 
-    # --- [NEW] Helper function for drawing clean text panels ---
     def draw_panel(frame, title, lines, origin, panel_width):
         x, y = origin
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        thickness = 1
-        line_height = 20
-        
+        font_scale, thickness, line_height = 0.5, 1, 20
         panel_height = (len(lines) + 1) * line_height + 15
-        
         overlay = frame.copy()
         cv2.rectangle(overlay, (x, y), (x + panel_width, y + panel_height), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-        
-        # Draw Title
         cv2.putText(frame, title, (x + 5, y + 18), font, font_scale, (255, 255, 0), thickness, cv2.LINE_AA)
-        
-        # Draw Lines
         for i, line in enumerate(lines):
             cv2.putText(frame, line, (x + 5, y + (i + 2) * line_height), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
@@ -241,22 +269,20 @@ def main(cfg: Config):
         while True:
             t_total_start = time.time()
             ret, frame = cap.read()
-            if not ret: break
+            if not ret: 
+                print("[INFO] End of video file reached or camera disconnected.")
+                break
             
             display_frame = cv2.resize(frame, cfg.resolution)
             h, w = display_frame.shape[:2]
 
-            # --- Frame Skipping for YOLO ---
             frame_counter += 1
-            if frame_counter % 3 == 0:
-                if frame_queue.empty():
-                    frame_queue.put(np.copy(display_frame))
+            if frame_counter % 3 == 0 and frame_queue.empty():
+                frame_queue.put(np.copy(display_frame))
 
-            # --- Initialize variables for current frame ---
             lanes, steering_angle, deviation, lane_center_coords = [], 0.0, None, None
             lane_mask = np.zeros(display_frame.shape[:2], dtype=np.uint8)
 
-            # --- Centralized Lane Processing ---
             t_lane_start = time.time()
             if lane_detection_enabled:
                 lanes = lane_detector.detect_lanes(display_frame)
@@ -268,148 +294,72 @@ def main(cfg: Config):
                     cv2.fillPoly(overlay, [np.array([lanes[0][:2], lanes[0][2:], lanes[1][2:], lanes[1][:2]], dtype=np.int32)], (255, 255, 255))
                     display_frame = cv2.addWeighted(overlay, 0.2, display_frame, 0.8, 0)
                     
-                    y_limit = int(h * 0.65)
+                    y_limit = lane_detector.meters_to_y(cfg.detection_distance_m, h)
+                    text = f"Detection Limit ({cfg.detection_distance_m:.0f}m)"
+                    
                     left_line, right_line = sorted(lanes, key=lambda line: line[0])
-                    rx1, ry1, rx2, ry2 = right_line
-                    midpoint_x = (rx1 + rx2) // 2
-                    midpoint_y = (ry1 + ry2) // 2
-                    text = f"Distance ({cfg.max_detection_dist_m:.0f}m)"
-                    text_position = (midpoint_x - 20, midpoint_y - 20) # 10px to the right of the line
-                    cv2.putText(display_frame, text, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
                     x_start = keeper._x_at_y(left_line, y_limit)
                     x_end = keeper._x_at_y(right_line, y_limit)
+
                     if x_start is not None and x_end is not None:
                         cv2.line(display_frame, (x_start, y_limit), (x_end, y_limit), (255, 255, 0), 2)
-                        text_x = (x_start + x_end) // 2 - 70 # Adjust for text width
-                        cv2.putText(display_frame, f"Detection Limit", 
-                                    (text_x + 10, y_limit + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+                        text_x = (x_start + x_end) // 2 - 70
+                        cv2.putText(display_frame, text, (text_x, y_limit - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
             lane_time = time.time() - t_lane_start
             if lane_time > 0: lane_fps = 1.0 / lane_time
 
-            # --- Bounding Box Handling ---
             try:
-                # [MODIFIED] Unpack results and processing time
                 new_results, yolo_time = results_queue.get_nowait()
                 if yolo_time > 0: yolo_fps = 1.0 / yolo_time
-                
                 temp_boxes = []
                 for box in new_results[0].boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     label = new_results[0].names[int(box.cls[0])]
-                    dist = estimate_distance(cfg, y2 - y1)
+                    dist = estimate_distance(cfg, y2 - y1, label)
                     bcx, bcy = (x1 + x2) // 2, y2
-                    
-                    # ... ภายในลูป for box in new_results[0].boxes: ...
-
-                    status = ""
-                    color = (200, 200, 200) # Default to a neutral gray color
-
-                    # Only apply specific colors and status if lane detection is ON
+                    status, color = "Detected", (200, 200, 200)
                     if lane_detection_enabled:
-                        # 1. ตรวจสอบก่อนเลยว่าวัตถุอยู่ไกลเกินไปหรือไม่ (สำคัญที่สุด)
-                        if dist > cfg.max_detection_dist_m:
-                            status, color = "Too Far", (0, 255, 255)      # Yellow
-
-                        # 2. ถ้าไม่ไกลเกินไป ค่อยเช็คว่าอยู่ในเลนหรือไม่
+                        if dist > cfg.detection_distance_m:
+                            status, color = "Too Far", (0, 255, 255)
                         elif 0 <= bcy < h and 0 <= bcx < w and lane_mask[bcy, bcx] == 255:
-                            status, color = "In Lane", (0, 255, 0)      # Green
-
-                        # 3. กรณีสุดท้ายคืออยู่นอกเลน (แต่ยังอยู่ในระยะ)
+                            status, color = "In Lane", (0, 255, 0)
                         else:
-                            status, color = "Out of Lane", (0, 0, 255)  # Red
-                    else:
-                        # If lane detection is OFF, all objects are simply "Detected"
-                        status = "Detected"
-
-                    temp_boxes.append({
-                        "xyxy": (x1, y1, x2, y2), "label": label, "dist": dist,
-                        "center": (bcx, bcy), "color": color, "status": status
-                    })
-                
-                # [FIXED] Corrected the typo in the variable name
-                last_known_boxes = temp_boxes 
-                
+                            status, color = "Out of Lane", (0, 0, 255)
+                    temp_boxes.append({"xyxy": (x1, y1, x2, y2), "label": label, "dist": dist, "center": (bcx, bcy), "color": color, "status": status})
+                last_known_boxes = temp_boxes
             except Empty:
                 pass
-
-            # --- Drawing Boxes ---
-            in_lane_labels, out_lane_labels, too_far_labels = [], [], []
-            if last_known_boxes:
-                for box_data in last_known_boxes:
-                    (x1, y1, x2, y2) = box_data["xyxy"]
-                    color, label = box_data["color"], box_data["label"]
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(display_frame, f"{label} {box_data['dist']:.1f}m", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                    
-                    if box_data["status"] == "In Lane": in_lane_labels.append(label)
-                    elif box_data["status"] == "Out of Lane": out_lane_labels.append(label)
-                    else: too_far_labels.append(label)
-
-            # --- [NEW] Organized Info Display ---
+                
+            for box_data in last_known_boxes:
+                (x1, y1, x2, y2) = box_data["xyxy"]
+                color, label = box_data["color"], box_data["label"]
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(display_frame, f"{label} {box_data['dist']:.1f}m", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
             total_fps = 1.0 / (time.time() - t_total_start)
-
-            # Panel 1: Performance (Top Right)
-            perf_lines = [
-                f"Total: {total_fps:.1f} FPS",
-                f"Lane : {lane_fps:.1f} FPS" if lane_detection_enabled else "Lane : OFF",
-                f"YOLO : {yolo_fps:.1f} FPS"
-            ]
+            perf_lines = [f"Total: {total_fps:.1f} FPS", f"Lane : {lane_fps:.1f} FPS" if lane_detection_enabled else "Lane : OFF", f"YOLO : {yolo_fps:.1f} FPS"]
             draw_panel(display_frame, "PERFORMANCE", perf_lines, (w - 170, 10), 160)
-            
-            # Panel 2: System Status (Top Left)
-            # Panel for System Status / Driving Info (Top Left)
-            # This panel conditionally switches between two displays.
-
             if lane_detection_enabled and motor_enable:
-                # STATE 1: Show "DRIVING INFO" when both systems are active.
-                driving_lines = [
-                    f"Rec. Speed : {cfg.normal_speed} km/h",
-                    f"Rec. Angle : {steering_angle:.1f}",
-                    f"Motor Angle: {motor.current_angle:.1f}"
-                ]
+                driving_lines = [f"Rec. Speed : {cfg.normal_speed} km/h", f"Rec. Angle : {steering_angle:.1f}", f"Motor Angle: {motor.current_angle:.1f}"]
                 draw_panel(display_frame, "DRIVING INFO", driving_lines, (10, 10), 200)
-
             else:
-                # STATE 2: Show "SYSTEM STATUS" if either system is off.
-                status_lines = [
-                    f"Lane Assist: {'ON' if lane_detection_enabled else 'OFF'}",
-                    f"Motor      : {'ON' if motor_enable else 'OFF'}"
-                ]
+                status_lines = [f"Lane Assist: {'ON' if lane_detection_enabled else 'OFF'}", f"Motor      : {'ON' if motor_enable else 'OFF'}"]
                 draw_panel(display_frame, "SYSTEM STATUS", status_lines, (10, 10), 200)
-            
-            # Panel 3: Objects (Bottom Left)
-            # First, collect all object labels from the current frame
             all_labels = [data['label'] for data in last_known_boxes]
-
             if lane_detection_enabled:
-                # If lane assist is ON, create categorized lists
                 in_lane_labels = [data['label'] for data in last_known_boxes if data['status'] == 'In Lane']
                 out_lane_labels = [data['label'] for data in last_known_boxes if data['status'] == 'Out of Lane']
                 too_far_labels = [data['label'] for data in last_known_boxes if data['status'] == 'Too Far']
-                
-                # --- [FIXED] Changed l[0] to l to show full label names ---
                 in_str = ", ".join([f"{c} {l}" for l, c in Counter(in_lane_labels).items()])
                 out_str = ", ".join([f"{c} {l}" for l, c in Counter(out_lane_labels).items()])
                 far_str = ", ".join([f"{c} {l}" for l, c in Counter(too_far_labels).items()])
-                
-                obj_lines = [
-                    f"In Lane : {in_str or 'None'}",
-                    f"Out Lane: {out_str or 'None'}",
-                    f"Too Far : {far_str or 'None'}"
-                ]
+                obj_lines = [f"In Lane : {in_str or 'None'}", f"Out Lane: {out_str or 'None'}", f"Too Far : {far_str or 'None'}"]
             else:
-                # If lane assist is OFF, create one combined list
-                # --- [FIXED] Changed l[0] to l here as well ---
                 all_str = ", ".join([f"{c} {l}" for l, c in Counter(all_labels).items()])
-                obj_lines = [
-                    f"Detected: {all_str or 'None'}"
-                ]
+                obj_lines = [f"Detected: {all_str or 'None'}"]
+            draw_panel(display_frame, "DETECTED OBJECTS", obj_lines, (10, h - (len(obj_lines)*20 + 35)), 250)
 
-            # --- [MODIFIED] Increased panel width to accommodate longer text ---
-            draw_panel(display_frame, "DETECTED OBJECTS", obj_lines, (230, 10), 220)
-            
-            # --- Visualizations & Motor Control ---
             if lane_detection_enabled and lane_center_coords:
                 lc_x, lc_y = lane_center_coords
                 cv2.line(display_frame, (w // 2, lc_y), (lc_x, lc_y), (0, 0, 255), 3)
@@ -421,21 +371,17 @@ def main(cfg: Config):
             else:
                 motor.set_stop()
 
-            cv2.imshow("High-Performance Lane and Object Detection", display_frame)
+            cv2.imshow("Lane and Object Detection System", display_frame)
             key = cv2.waitKey(1) & 0xFF
             
             if key == ord('q') or key == 27: break
             if key == ord('e'):
                 lane_detection_enabled = not lane_detection_enabled
-                if not lane_detection_enabled:
-                    motor_enable = False
+                if not lane_detection_enabled: motor_enable = False
             if key == ord('m'):
-                if lane_detection_enabled:
-                    motor_enable = not motor_enable
-                else:
-                    motor_enable = False
+                if lane_detection_enabled: motor_enable = not motor_enable
+                else: motor_enable = False
     finally:
-        # --- Graceful Shutdown ---
         print("\nStopping threads...")
         stop_event.set()
         if frame_queue.empty(): frame_queue.put(None) 
@@ -447,4 +393,44 @@ def main(cfg: Config):
 
 if __name__ == "__main__":
     config = Config()
+
+    while True:
+        print("--- Video Source Selection ---")
+        choice = input("  1: Live Camera\n  2: Video File\nEnter your choice (1 or 2): ")
+        if choice == '1':
+            while True:
+                cam_index_str = input("Enter camera index [default: 0]: ")
+                if not cam_index_str: config.source = 0; break
+                elif cam_index_str.isdigit(): config.source = int(cam_index_str); break
+                else: print("[ERROR] Invalid input. Please enter a number.")
+            print(f"[INFO] Using camera index: {config.source}")
+            break
+        elif choice == '2':
+            while True:
+                video_path = "/home/rpi/Downloads/สร้างวิดีโอกล้องหน้ารถที่กำลัง.mp4"#input("Enter the full path to your video file: ")
+                if video_path: config.source = video_path; break
+                else: print("[ERROR] Path cannot be empty.")
+            print(f"[INFO] Using video file: {config.source}")
+            break
+        else:
+            print("\n[ERROR] Invalid choice. Please enter 1 or 2.\n")
+    
+    while True:
+        prompt = f"\nEnter detection distance in meters [default: {config.detection_distance_m}]: "
+        dist_str = input(prompt)
+        if not dist_str:
+            print(f"[INFO] Using default distance: {config.detection_distance_m}m")
+            break
+        try:
+            dist_val = float(dist_str)
+            if dist_val > 0:
+                config.detection_distance_m = dist_val
+                print(f"[INFO] Set detection distance to: {config.detection_distance_m}m")
+                break
+            else:
+                print("[ERROR] Distance must be a positive number.")
+        except ValueError:
+            print("[ERROR] Invalid input. Please enter a number (e.g., 70.0).")
+
+    print(f"\n[INFO] Starting detection...")
     main(config)
