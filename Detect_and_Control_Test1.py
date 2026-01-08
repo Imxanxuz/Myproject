@@ -3,7 +3,8 @@
 
 import cv2
 import numpy as np
-import time
+import time 
+from time import sleep
 from dataclasses import dataclass, field
 from ultralytics import YOLO
 import RPi.GPIO as GPIO
@@ -11,10 +12,9 @@ from collections import deque, Counter
 import threading
 from queue import Queue, Empty
 
-# --- Configuration ---
+# Config
 GPIO.setwarnings(False)
 GPIO_MODE = True
-
 @dataclass
 class Config:
     model_path: str = "/home/rpi/yolo/yolo11n.pt"
@@ -26,9 +26,9 @@ class Config:
     # --- [NEW] Steering & PID Control ---
     STEERING_RANGE: tuple = (60.0, 120.0)  # (Min=Left, Max=Right)
     STEERING_CENTER: float = 90.0
-    # (Kp, Ki, Kd) - *** ค่าเหล่านี้ต้องจูนใหม่! ***
+    # (Kp, Ki, Kd) 
     PID_GAINS: tuple = (0.006, 0.015, 0.004) # (P, I, D)
-    PID_WINDUP_LIMIT: float = 100.0  # ขีดจำกัดของ Integral term
+    PID_WINDUP_LIMIT: float = 100.0  
 
     # --- [MODIFIED] Lane Detection Tuning ---
     roi_top_ratio: float = 0.67
@@ -41,18 +41,18 @@ class Config:
     poly_fit_margin: int = 75
     poly_min_points_for_fit: int = 10
     
-    # --- [NEW] Lane Sanity Check Parameters ---
+    # Lane Sanity Check Parameters ---
     LANE_SANITY_CHECK_PX: tuple = (250, 700)
     LANE_SANITY_CHECK_RATIO: tuple = (0.7, 3.0)
 
-    # --- [NEW] Request 7: Narrow ROI Bottom ---
+    # ROI Bottom ---
     roi_bottom_left_x_ratio: float = 0.1  # 10% from left edge
     roi_bottom_right_x_ratio: float = 0.85  # 70% from left edge (10% from right)
 
-    # --- Other Parameters ---
+    #Other Parameters
     focal_length: float = 1700.0
     normal_speed: int = 30
-    # detection_distance_m (ยังเก็บไว้เผื่อใช้ในอนาคต แต่ไม่วาดแล้ว)
+    # detection_distance_m
     detection_distance_m: float = 75.0 
     lane_origin_y_ratio: float = 0.75 # Y-level for PID calculation
     
@@ -65,9 +65,7 @@ class Config:
     })
     DEFAULT_OBJECT_HEIGHT: float = 1.5
 
-
-# --- MotorControl Class (MODIFIED for 60-120 range) ---
-class MotorControl:
+#class MotorControl:
     def __init__(self, pin_b, pin_c, freq=50, steering_range=(60.0, 120.0)):
         self.pin_b = pin_b
         self.pin_c = pin_c
@@ -118,8 +116,84 @@ class MotorControl:
             self.servo_pwm1.stop()
             self.servo_pwm2.stop()
             GPIO.cleanup()
+class MotorControl_to_MotorDriver:
+    def __init__(self,IN1 = 23, IN2 = 24,ENA = None,ENB = None,IN3 = 25, IN4 = 26, freq=100, steering_range=(60.0, 120.0)):
+        self.IN1 = IN1
+        self.IN2 = IN2
+        self.IN3 = IN3
+        self.IN4 = IN4
+        self.ENA = ENA
+        self.ENB = ENB
+        self.freq = freq
+        self.steering_range = steering_range
+        self.center_angle = (steering_range[0] + steering_range[1]) / 2.0 # Should be 90.0
+        
+        self.min_duty = 6.667
+        self.center_duty = 7.5
+        self.max_duty = 8.333
+        
+        self.servo_pwm1 = None
+        self.servo_pwm2 = None
+        self.current_angle = self.center_angle
+        
+        if GPIO_MODE:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(self.IN1, GPIO.OUT)
+            GPIO.setup(self.IN2, GPIO.OUT)
+            GPIO.setup(self.IN3, GPIO.OUT)
+            GPIO.setup(self.IN4, GPIO.OUT)
+            GPIO.setup(self.ENA, GPIO.OUT)
+            GPIO.setup(self.ENB, GPIO.OUT)
+            self.servo_pwm1 = GPIO.PWM(self.ENA, self.freq)
+            self.servo_pwm2 = GPIO.PWM(self.ENB, self.freq)
+            self.servo_pwm1.start(self.center_duty)
+            self.servo_pwm2.start(self.center_duty)
 
-# --- LaneDetector Class (MODIFIED with Sanity Check & ROI) ---
+    def _angle_to_duty(self, angle: float) -> float:
+        angle = np.clip(angle, self.steering_range[0], self.steering_range[1])
+        return np.interp(
+            angle,
+            [self.steering_range[0], self.center_angle, self.steering_range[1]],
+            [self.min_duty, self.center_duty, self.max_duty]
+        )
+        
+    def move_to(self, angle: float):
+        self.current_angle = angle
+        duty = self._angle_to_duty(self.current_angle)
+        if GPIO_MODE:
+            self.servo_pwm1.ChangeDutyCycle(duty)
+            self.servo_pwm2.ChangeDutyCycle(duty)
+    
+    def forward(self,speed):
+        if GPIO_MODE:
+            GPIO.output(self.IN1, GPIO.HIGH)
+            GPIO.output(self.IN2, GPIO.LOW)
+            GPIO.output(self.IN3, GPIO.HIGH)
+            GPIO.output(self.IN4, GPIO.LOW)
+            self.servo_pwm1.ChangeDutyCycle(speed)
+            self.servo_pwm2.ChangeDutyCycle(speed)
+        
+
+    def set_stop(self):
+        if GPIO_MODE:
+            self.servo_pwm1.ChangeDutyCycle(0)
+            self.servo_pwm2.ChangeDutyCycle(0)
+        self.current_angle = self.center_angle 
+
+    def stop(self):
+        if GPIO_MODE:
+            self.servo_pwm1.stop()
+            self.servo_pwm2.stop()
+            GPIO.cleanup()
+
+    try :
+        forward(50)
+        sleep(1)
+        stop()
+        GPIO.cleanup()
+    except KeyboardInterrupt:
+        GPIO.cleanup()
+
 class LaneDetector:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -292,7 +366,6 @@ class LaneDetector:
         cv2.fillPoly(mask, [points], 255)
         return mask
 
-# --- LaneKeeper Class (MODIFIED for PID Controller) ---
 class LaneKeeper:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -357,14 +430,12 @@ class LaneKeeper:
         return final_angle, deviation, (lane_center, y_ref)
 
 
-# --- Helper Functions ---
 def estimate_distance(cfg: Config, box_h: int, label: str) -> float:
     if box_h <= 0: return float("inf")
     real_height = cfg.OBJECT_REAL_HEIGHTS.get(label, cfg.DEFAULT_OBJECT_HEIGHT)
     distance = (cfg.focal_length * real_height) / box_h
     return distance
 
-# --- YOLO Worker Thread ---
 def yolo_worker(cfg, frame_queue, results_queue, stop_event):
     print("[INFO] YOLO worker thread started.")
     model = YOLO(cfg.model_path)
@@ -397,7 +468,8 @@ def yolo_worker(cfg, frame_queue, results_queue, stop_event):
 def main(cfg: Config):
     lane_detector = LaneDetector(cfg)
     keeper = LaneKeeper(cfg)
-    motor = MotorControl(pin_b=19, pin_c=13, steering_range=cfg.STEERING_RANGE)
+    #motor = MotorControl(pin_b=19, pin_c=13, steering_range=cfg.STEERING_RANGE)
+    motor = MotorControl_to_MotorDriver(ENA = 9,ENB = 19,steering_range = cfg.STEERING_RANGE)
     
     cap = cv2.VideoCapture(cfg.source)
     if not cap.isOpened():
@@ -478,10 +550,6 @@ def main(cfg: Config):
                         points = np.vstack([pts_left, np.flipud(pts_right)]).astype(np.int32)
                         cv2.fillPoly(overlay, [points], (255, 255, 255))
                         display_frame = cv2.addWeighted(overlay, 0.2, display_frame, 0.8, 0)
-                    
-                    # --- [REMOVED] ---
-                    # บล็อกโค้ดสำหรับวาด Detection Limit ได้ถูกลบออกจากที่นี่แล้ว
-                    # --- [END REMOVED] ---
             
             try:
                 new_results, yolo_time = results_queue.get_nowait()
@@ -583,7 +651,7 @@ def main(cfg: Config):
                 if lane_detection_enabled: motor_enable = not motor_enable
                 else: motor_enable = False
     finally:
-        print("\nStopping threads...")
+        print("\nStopping")
         stop_event.set()
         if frame_queue.empty(): frame_queue.put(None) 
         yolo_thread.join()
@@ -621,11 +689,6 @@ if __name__ == "__main__":
             break
         else:
             print("\n[ERROR] Invalid choice. Please enter 1 or 2.\n")
-    
-    # --- [REMOVED] ---
-    # บล็อกสำหรับถาม "detection distance" ถูกลบออกแล้ว
-    # เนื่องจากค่านี้ไม่ได้ใช้ในการวาดผลลัพธ์อีกต่อไป
-    # --- [END REMOVED] ---
 
     print(f"\n[INFO] Starting detection...")
     main(config)
