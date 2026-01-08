@@ -65,134 +65,50 @@ class Config:
     })
     DEFAULT_OBJECT_HEIGHT: float = 1.5
 
-#class MotorControl:
-    def __init__(self, pin_b, pin_c, freq=50, steering_range=(60.0, 120.0)):
-        self.pin_b = pin_b
-        self.pin_c = pin_c
-        self.freq = freq
-        self.steering_range = steering_range
-        self.center_angle = (steering_range[0] + steering_range[1]) / 2.0 # Should be 90.0
-        
-        self.min_duty = 6.667
-        self.center_duty = 7.5
-        self.max_duty = 8.333
-        
-        self.servo_pwm1 = None
-        self.servo_pwm2 = None
-        self.current_angle = self.center_angle
-        
-        if GPIO_MODE:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self.pin_b, GPIO.OUT)
-            GPIO.setup(self.pin_c, GPIO.OUT)
-            self.servo_pwm1 = GPIO.PWM(self.pin_b, self.freq)
-            self.servo_pwm2 = GPIO.PWM(self.pin_c, self.freq)
-            self.servo_pwm1.start(self.center_duty)
-            self.servo_pwm2.start(self.center_duty)
-
-    def _angle_to_duty(self, angle: float) -> float:
-        angle = np.clip(angle, self.steering_range[0], self.steering_range[1])
-        return np.interp(
-            angle,
-            [self.steering_range[0], self.center_angle, self.steering_range[1]],
-            [self.min_duty, self.center_duty, self.max_duty]
-        )
-
-    def move_to(self, angle: float):
-        self.current_angle = angle
-        duty = self._angle_to_duty(self.current_angle)
-        if GPIO_MODE:
-            self.servo_pwm1.ChangeDutyCycle(duty)
-            self.servo_pwm2.ChangeDutyCycle(duty)
-
-    def set_stop(self):
-        if GPIO_MODE:
-            self.servo_pwm1.ChangeDutyCycle(0)
-            self.servo_pwm2.ChangeDutyCycle(0)
-        self.current_angle = self.center_angle 
-
-    def stop(self):
-        if GPIO_MODE:
-            self.servo_pwm1.stop()
-            self.servo_pwm2.stop()
-            GPIO.cleanup()
 class MotorControl_to_MotorDriver:
-    def __init__(self,IN1 = 23, IN2 = 24,ENA = None,ENB = None,IN3 = 25, IN4 = 26, freq=100, steering_range=(60.0, 120.0)):
-        self.IN1 = IN1
-        self.IN2 = IN2
-        self.IN3 = IN3
-        self.IN4 = IN4
-        self.ENA = ENA
-        self.ENB = ENB
-        self.freq = freq
+    def __init__(self, IN1=23, IN2=24, IN3=25, IN4=26, ENA=9, ENB=11, freq=100, steering_range=(60.0, 120.0)):
+        self.IN1, self.IN2 = IN1, IN2
+        self.IN3, self.IN4 = IN3, IN4
+        self.ENA, self.ENB = ENA, ENB
         self.steering_range = steering_range
-        self.center_angle = (steering_range[0] + steering_range[1]) / 2.0 # Should be 90.0
-        
-        self.min_duty = 6.667
-        self.center_duty = 7.5
-        self.max_duty = 8.333
-        
-        self.servo_pwm1 = None
-        self.servo_pwm2 = None
-        self.current_angle = self.center_angle
+        self.center_angle = 90.0
         
         if GPIO_MODE:
             GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self.IN1, GPIO.OUT)
-            GPIO.setup(self.IN2, GPIO.OUT)
-            GPIO.setup(self.IN3, GPIO.OUT)
-            GPIO.setup(self.IN4, GPIO.OUT)
-            GPIO.setup(self.ENA, GPIO.OUT)
-            GPIO.setup(self.ENB, GPIO.OUT)
-            self.servo_pwm1 = GPIO.PWM(self.ENA, self.freq)
-            self.servo_pwm2 = GPIO.PWM(self.ENB, self.freq)
-            self.servo_pwm1.start(self.center_duty)
-            self.servo_pwm2.start(self.center_duty)
+            for pin in [self.IN1, self.IN2, self.IN3, self.IN4, self.ENA, self.ENB]:
+                GPIO.setup(pin, GPIO.OUT)
+            
+            self.pwm_left = GPIO.PWM(self.ENA, freq)
+            self.pwm_right = GPIO.PWM(self.ENB, freq)
+            self.pwm_left.start(0)
+            self.pwm_right.start(0)
+            self.current_angle = self.center_angle
 
-    def _angle_to_duty(self, angle: float) -> float:
-        angle = np.clip(angle, self.steering_range[0], self.steering_range[1])
-        return np.interp(
-            angle,
-            [self.steering_range[0], self.center_angle, self.steering_range[1]],
-            [self.min_duty, self.center_duty, self.max_duty]
-        )
-        
-    def move_to(self, angle: float):
+    def move_to(self, angle, base_speed=40):
+
         self.current_angle = angle
-        duty = self._angle_to_duty(self.current_angle)
-        if GPIO_MODE:
-            self.servo_pwm1.ChangeDutyCycle(duty)
-            self.servo_pwm2.ChangeDutyCycle(duty)
-    
-    def forward(self,speed):
-        if GPIO_MODE:
-            GPIO.output(self.IN1, GPIO.HIGH)
-            GPIO.output(self.IN2, GPIO.LOW)
-            GPIO.output(self.IN3, GPIO.HIGH)
-            GPIO.output(self.IN4, GPIO.LOW)
-            self.servo_pwm1.ChangeDutyCycle(speed)
-            self.servo_pwm2.ChangeDutyCycle(speed)
+        deviation = angle - self.center_angle
+        left_speed = np.clip(base_speed + deviation, 0, 100)
+        right_speed = np.clip(base_speed - deviation, 0, 100)
         
+        if GPIO_MODE:
+            GPIO.output(self.IN1, GPIO.HIGH); GPIO.output(self.IN2, GPIO.LOW)
+            GPIO.output(self.IN3, GPIO.HIGH); GPIO.output(self.IN4, GPIO.LOW)
+            self.pwm_left.ChangeDutyCycle(left_speed)
+            self.pwm_right.ChangeDutyCycle(right_speed)
 
     def set_stop(self):
         if GPIO_MODE:
-            self.servo_pwm1.ChangeDutyCycle(0)
-            self.servo_pwm2.ChangeDutyCycle(0)
-        self.current_angle = self.center_angle 
+            self.pwm_left.ChangeDutyCycle(0)
+            self.pwm_right.ChangeDutyCycle(0)
+            GPIO.output(self.IN1, GPIO.LOW); GPIO.output(self.IN2, GPIO.LOW)
+            GPIO.output(self.IN3, GPIO.LOW); GPIO.output(self.IN4, GPIO.LOW)
 
     def stop(self):
         if GPIO_MODE:
-            self.servo_pwm1.stop()
-            self.servo_pwm2.stop()
+            self.pwm_left.stop()
+            self.pwm_right.stop()
             GPIO.cleanup()
-
-    try :
-        forward(50)
-        sleep(1)
-        stop()
-        GPIO.cleanup()
-    except KeyboardInterrupt:
-        GPIO.cleanup()
 
 class LaneDetector:
     def __init__(self, cfg: Config):
@@ -468,8 +384,7 @@ def yolo_worker(cfg, frame_queue, results_queue, stop_event):
 def main(cfg: Config):
     lane_detector = LaneDetector(cfg)
     keeper = LaneKeeper(cfg)
-    #motor = MotorControl(pin_b=19, pin_c=13, steering_range=cfg.STEERING_RANGE)
-    motor = MotorControl_to_MotorDriver(ENA = 9,ENB = 19,steering_range = cfg.STEERING_RANGE)
+    motor = MotorControl_to_MotorDriver(ENA=9, ENB=11, steering_range=cfg.STEERING_RANGE)
     
     cap = cv2.VideoCapture(cfg.source)
     if not cap.isOpened():
@@ -485,8 +400,8 @@ def main(cfg: Config):
     yolo_thread = threading.Thread(target=yolo_worker, args=(cfg, frame_queue, results_queue, stop_event))
     yolo_thread.start()
 
-    lane_detection_enabled = False
-    motor_enable = False
+    lane_detection_enabled = True
+    motor_enable =  True
     last_known_boxes = []
     frame_counter = 0
     lane_fps, yolo_fps, total_fps = 0, 0, 0
@@ -634,7 +549,7 @@ def main(cfg: Config):
             if motor_enable:
                 current_time = time.time()
                 if (current_time - last_motor_update_time) >= 0.5:
-                    motor.move_to(steering_angle)
+                    motor.move_to(steering_angle, base_speed=cfg.normal_speed)
                     last_motor_update_time = current_time
                 # (No 'else' needed, motor holds its last position)
             else:
