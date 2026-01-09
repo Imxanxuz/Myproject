@@ -64,7 +64,57 @@ class Config:
         "person": 1.7, "car": 1.5, "truck": 3.5, "bus": 3.2, "bicycle": 1.0, "motorcycle": 1.2
     })
     DEFAULT_OBJECT_HEIGHT: float = 1.5
+#class MotorControl:
+    def __init__(self, pin_b, pin_c, freq=50, steering_range=(60.0, 120.0)):
+        self.pin_b = pin_b
+        self.pin_c = pin_c
+        self.freq = freq
+        self.steering_range = steering_range
+        self.center_angle = (steering_range[0] + steering_range[1]) / 2.0 # Should be 90.0
+        
+        self.min_duty = 6.667
+        self.center_duty = 7.5
+        self.max_duty = 8.333
+        
+        self.servo_pwm1 = None
+        self.servo_pwm2 = None
+        self.current_angle = self.center_angle
+        
+        if GPIO_MODE:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(self.pin_b, GPIO.OUT)
+            GPIO.setup(self.pin_c, GPIO.OUT)
+            self.servo_pwm1 = GPIO.PWM(self.pin_b, self.freq)
+            self.servo_pwm2 = GPIO.PWM(self.pin_c, self.freq)
+            self.servo_pwm1.start(self.center_duty)
+            self.servo_pwm2.start(self.center_duty)
 
+    def _angle_to_duty(self, angle: float) -> float:
+        angle = np.clip(angle, self.steering_range[0], self.steering_range[1])
+        return np.interp(
+            angle,
+            [self.steering_range[0], self.center_angle, self.steering_range[1]],
+            [self.min_duty, self.center_duty, self.max_duty]
+        )
+
+    def move_to(self, angle: float):
+        self.current_angle = angle
+        duty = self._angle_to_duty(self.current_angle)
+        if GPIO_MODE:
+            self.servo_pwm1.ChangeDutyCycle(duty)
+            self.servo_pwm2.ChangeDutyCycle(duty)
+
+    def set_stop(self):
+        if GPIO_MODE:
+            self.servo_pwm1.ChangeDutyCycle(0)
+            self.servo_pwm2.ChangeDutyCycle(0)
+        self.current_angle = self.center_angle 
+
+    def stop(self):
+        if GPIO_MODE:
+            self.servo_pwm1.stop()
+            self.servo_pwm2.stop()
+            GPIO.cleanup()
 class MotorControl_to_MotorDriver:
     def __init__(self, IN1=23, IN2=24, IN3=25, IN4=26, ENA=9, ENB=11, freq=100, steering_range=(60.0, 120.0)):
         self.IN1, self.IN2 = IN1, IN2
@@ -78,6 +128,7 @@ class MotorControl_to_MotorDriver:
             for pin in [self.IN1, self.IN2, self.IN3, self.IN4, self.ENA, self.ENB]:
                 GPIO.setup(pin, GPIO.OUT)
             
+            # ตั้งค่า PWM สำหรับความเร็ว (Enable Pins)
             self.pwm_left = GPIO.PWM(self.ENA, freq)
             self.pwm_right = GPIO.PWM(self.ENB, freq)
             self.pwm_left.start(0)
@@ -85,13 +136,13 @@ class MotorControl_to_MotorDriver:
             self.current_angle = self.center_angle
 
     def move_to(self, angle, base_speed=40):
-
         self.current_angle = angle
         deviation = angle - self.center_angle
         left_speed = np.clip(base_speed + deviation, 0, 100)
         right_speed = np.clip(base_speed - deviation, 0, 100)
         
         if GPIO_MODE:
+            # Go stragth 
             GPIO.output(self.IN1, GPIO.HIGH); GPIO.output(self.IN2, GPIO.LOW)
             GPIO.output(self.IN3, GPIO.HIGH); GPIO.output(self.IN4, GPIO.LOW)
             self.pwm_left.ChangeDutyCycle(left_speed)
@@ -109,7 +160,25 @@ class MotorControl_to_MotorDriver:
             self.pwm_left.stop()
             self.pwm_right.stop()
             GPIO.cleanup()
-
+class Safety:
+    def __init__(self,move_stop = 2.0,move_to = 5.0):
+        self.move_stop = move_stop
+        self.move_to = move_to
+        self.auto_stop_active = False 
+    def movement_update (self,last_known_boxes):
+        in_lane_labels = [data['label'] for data in last_known_boxes if data['status'] == 'In Lane']
+        if in_lane_labels :
+            min_dist = min(data['label'] for data in in_lane_labels) 
+            if self.move_stop < min_dist <= self.move_to or min_dist > self.move_to :
+                self.auto_stop_active = False
+            elif min_dist <= self.move_stop :
+                self.auto_stop_active = True
+            else :
+                print('Error (can not found min_dist)')
+                self.auto_stop_active = True
+        else :
+            self.auto_stop_active = False 
+        return self.auto_stop_active ,(min(data['labels'] for data in in_lane_labels) if in_lane_labels else None)
 class LaneDetector:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -281,7 +350,6 @@ class LaneDetector:
         points = np.vstack([pts_left, np.flipud(pts_right)]).astype(np.int32)
         cv2.fillPoly(mask, [points], 255)
         return mask
-
 class LaneKeeper:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -344,14 +412,11 @@ class LaneKeeper:
         )
         
         return final_angle, deviation, (lane_center, y_ref)
-
-
 def estimate_distance(cfg: Config, box_h: int, label: str) -> float:
     if box_h <= 0: return float("inf")
     real_height = cfg.OBJECT_REAL_HEIGHTS.get(label, cfg.DEFAULT_OBJECT_HEIGHT)
     distance = (cfg.focal_length * real_height) / box_h
     return distance
-
 def yolo_worker(cfg, frame_queue, results_queue, stop_event):
     print("[INFO] YOLO worker thread started.")
     model = YOLO(cfg.model_path)
@@ -380,12 +445,11 @@ def yolo_worker(cfg, frame_queue, results_queue, stop_event):
             if stop_event.is_set(): break
     print("[INFO] YOLO worker thread stopped.")
 
-# --- Main Application (MODIFIED panels, object logic) ---
 def main(cfg: Config):
     lane_detector = LaneDetector(cfg)
     keeper = LaneKeeper(cfg)
-    motor = MotorControl_to_MotorDriver(ENA=9, ENB=11, steering_range=cfg.STEERING_RANGE)
-    
+    motor = MotorControl_to_MotorDriver(ENA = 9,ENB = 19,steering_range = cfg.STEERING_RANGE)
+    auto_stop = Safety(move_stop = 2.0 , move_to = 5.0 )
     cap = cv2.VideoCapture(cfg.source)
     if not cap.isOpened():
         print(f"[ERROR] Could not open video source: {cfg.source}")
@@ -399,13 +463,11 @@ def main(cfg: Config):
     stop_event = threading.Event()
     yolo_thread = threading.Thread(target=yolo_worker, args=(cfg, frame_queue, results_queue, stop_event))
     yolo_thread.start()
-
-    lane_detection_enabled = True
-    motor_enable =  True
+    lane_detection_enabled = False
+    motor_enable = False
     last_known_boxes = []
     frame_counter = 0
     lane_fps, yolo_fps, total_fps = 0, 0, 0
-    
     last_motor_update_time = 0.0
 
     def draw_panel(frame, title, lines, origin, panel_width):
@@ -485,7 +547,7 @@ def main(cfg: Config):
                 last_known_boxes = temp_boxes
             except Empty:
                 pass
-                
+        
             for box_data in last_known_boxes:
                 (x1, y1, x2, y2) = box_data["xyxy"]
                 color, label = box_data["color"], box_data["label"]
@@ -499,16 +561,18 @@ def main(cfg: Config):
                           f"Yaw  : {lane_fps:.1f} FPS", 
                           f"YOLO : {yolo_fps:.1f} FPS"]
             draw_panel(display_frame, "PERFORMANCE", perf_lines, (w - 170, 10), 160)
-            
+            is_blocked , current_min_dist = Safety.movement_update(last_known_boxes)
             if lane_detection_enabled and motor_enable:
                 driving_lines = [f"Rec. Speed : {cfg.normal_speed} km/h", 
                                  f"Rec. Angle : {steering_angle:.1f}", 
                                  f"Motor Angle: {motor.current_angle:.1f}"]
                 draw_panel(display_frame, "DRIVING INFO", driving_lines, (10, 10), 200)
             else:
-                status_lines = [f"Lane Assist: {'ON' if lane_detection_enabled else 'OFF'}", f"Motor       : {'ON' if motor_enable else 'OFF'}"]
+                status_lines = [f"Lane Assist: {'ON' if lane_detection_enabled else 'OFF'}", f"Motor       : {'ON' if motor_enable else 'OFF'}", f"Safety Brake : {'Stop!' if is_blocked else 'Safe'}"]
+                if current_min_dist:
+                    status_lines.append(f"Closest Obj : {current_min_dist:.1f}m")
                 draw_panel(display_frame, "SYSTEM STATUS", status_lines, (10, 10), 200)
-            
+
             in_lane_labels = [data['label'] for data in last_known_boxes if data['status'] == 'In Lane']
             out_lane_labels = [data['label'] for data in last_known_boxes if data['status'] == 'Out of Lane']
             in_str = ", ".join([f"{c} {l}" for l, c in Counter(in_lane_labels).items()])
@@ -517,41 +581,28 @@ def main(cfg: Config):
                          f"Out Lane: {out_str or 'None'}"]
             draw_panel(display_frame, "DETECTED OBJECTS", obj_lines, (10, h - (len(obj_lines)*20 + 35)), 250)
 
-            # --- [MODIFIED] Requests 4, 5, 6: Visualization moved to roi_top_ratio ---
             if lane_detection_enabled and left_fit is not None and right_fit is not None:
-                
-                # [MODIFIED] Set visualization Y-level to the top of the ROI
                 y_viz = int(h * cfg.roi_top_ratio) 
                 
                 x_left_viz = keeper._x_at_y(left_fit, y_viz)
                 x_right_viz = keeper._x_at_y(right_fit, y_viz)
 
                 if x_left_viz is not None and x_right_viz is not None:
-                    # Request 4: Horizontal line at top of ROI
                     cv2.line(display_frame, (int(x_left_viz), y_viz), (int(x_right_viz), y_viz), (0, 255, 255), 2)
-                    
-                    # Request 5: Deviation visualization at top of ROI
                     x_center_viz = (x_left_viz + x_right_viz) // 2
                     deviation_viz = x_center_viz - (w // 2)
-                    
                     cv2.line(display_frame, (w // 2, y_viz), (int(x_center_viz), y_viz), (0, 0, 255), 3) 
                     cv2.circle(display_frame, (int(x_center_viz), y_viz), 8, (0, 255, 0), -1) 
                     cv2.putText(display_frame, f"Deviation: {int(deviation_viz)}px", (w // 2 - 50, y_viz - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                    
-                    # Request 6: Arctan/Steering line (from bottom-center to top-viz-center)
                     cv2.line(display_frame, (w // 2, h - 1), (int(x_center_viz), y_viz), (255, 0, 255), 2)
-
-                # Draw vertical center line (from user's previous code, now dynamic to y_viz)
                 cv2.line(display_frame, (w // 2, y_viz), (w // 2, h - 1), (255, 100, 0), 2)
                 cv2.putText(display_frame, "Image Center", (w // 2 + 5, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-            # --- [END MODIFIED] ---
             
-            if motor_enable:
+            if motor_enable and not is_blocked:
                 current_time = time.time()
                 if (current_time - last_motor_update_time) >= 0.5:
-                    motor.move_to(steering_angle, base_speed=cfg.normal_speed)
+                    motor.move_to(steering_angle)
                     last_motor_update_time = current_time
-                # (No 'else' needed, motor holds its last position)
             else:
                 motor.set_stop()
 
@@ -579,31 +630,30 @@ if __name__ == "__main__":
     config = Config()
 
     while True:
-        print("--- Video Source Selection ---")
-        choice = input("  1: Live Camera\n  2: Video File\nEnter your choice (1 or 2): ")
+        print("Source Selection")
+        choice = input("  1: Live Camera\n  2: Video File: ")
         if choice == '1':
             while True:
-                cam_index_str = input("Enter camera index [default: 0]: ")
-                if not cam_index_str: config.source = 0; break
-                elif cam_index_str.isdigit(): config.source = int(cam_index_str); break
-                else: print("[ERROR] Invalid input. Please enter a number.")
-            print(f"[INFO] Using camera index: {config.source}")
+                cam_index_str = config.source = 0
+                if cam_index_str.isdigit(): config.source = int(cam_index_str); break
+                else: print("ERROR")
+            print(f"Camera index: {config.source}")
             break
         elif choice == '2':
             while True:
                 video_path = "/home/rpi/yolo/video_output_test/right2.mp4"
                 if not video_path:
-                    print(f"[INFO] No path entered, using default: {video_path}")
+                    print(f"Defult path: {video_path}")
                 
                 if video_path: 
                     config.source = video_path
                     break
                 else: 
-                    print("[ERROR] Path cannot be empty. Please try again.")
-            print(f"[INFO] Using video file: {config.source}")
+                    print("ERROR")
+            print(f"Using video file: {config.source}")
             break
         else:
-            print("\n[ERROR] Invalid choice. Please enter 1 or 2.\n")
+            print("\nchoice 1 or 2.\n")
 
-    print(f"\n[INFO] Starting detection...")
+    print(f"\nStarting detection")
     main(config)
