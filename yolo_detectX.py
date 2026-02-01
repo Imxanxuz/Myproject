@@ -11,34 +11,42 @@ from ultralytics import YOLO
 from collections import deque, Counter
 from queue import Queue, Empty
 
-# --- à¸ªà¸–à¸²à¸™à¸°à¸à¸²à¸£à¸‚à¸±à¸šà¸‚à¸µà¹ˆ (State Machine) ---
+# --- ระบบสถานะการตัดสินใจ (Autonomous Drive States) ---
 class DriveState:
-    NORMAL    = "NORMAL"    # à¸§à¸´à¹ˆà¸‡à¸•à¸²à¸¡à¹€à¸¥à¸™à¸›à¸à¸•à¸´
-    STOPPING  = "STOPPING"  # à¸žà¸šà¸§à¸±à¸•à¸–à¸¸à¹à¸¥à¸°à¸«à¸¢à¸¸à¸”à¸£à¸­
-    EVADING   = "EVADING"   # à¸«à¸±à¸à¸žà¸§à¸‡à¸¡à¸²à¸¥à¸±à¸¢à¸«à¸¥à¸šà¸­à¸­à¸
-    BYPASSING = "BYPASSING" # à¸§à¸´à¹ˆà¸‡à¹à¸‹à¸‡à¸‚à¸™à¸²à¸™à¹„à¸›à¸à¸±à¸šà¸§à¸±à¸•à¸–à¸¸
-    RETURNING = "RETURNING" # à¸«à¸±à¸à¸à¸¥à¸±à¸šà¹€à¸‚à¹‰à¸²à¹€à¸¥à¸™à¹€à¸”à¸´à¸¡
+    NORMAL    = "FOLLOW_LANE"  # วิ่งตามเลนปกติ
+    STOPPING  = "SAFE_STOP"    # ตรวจพบวัตถุระยะใกล้และหยุดรอ
+    EVADING   = "EVADE_OUT"    # หักพวงมาลัยเพื่อแซงออก
+    BYPASSING = "BYPASS_OBJ"   # วิ่งขนานไปกับวัตถุที่แซง
+    RETURNING = "RETURN_LANE"  # หักพวงมาลัยกลับเข้าเลนเดิม
 
 @dataclass
 class Config:
+    # --- [MODIFIED] Source changed to 0 for Live Camera ---
     model_path: str = "/home/rpi/yolo/yolo11n.pt"
-    source: any = "/home/rpi/yolo/video_output_test/right2.mp4"
+    source: any = 0 
     resolution: tuple = (640, 480)
     conf_thresh: float = 0.25
     imgsz: int = 192
     
-    # à¸žà¸²à¸£à¸²à¸¡à¸´à¹€à¸•à¸­à¸£à¹Œà¸à¸²à¸£à¸„à¸§à¸šà¸„à¸¸à¸¡
+    # การควบคุมมอเตอร์และ PID
     STEERING_RANGE: tuple = (60.0, 120.0)
     STEERING_CENTER: float = 90.0
     PID_GAINS: tuple = (0.007, 0.012, 0.004)
+    PID_WINDUP_LIMIT: float = 100.0
     
-    # à¸£à¸°à¸¢à¸°à¸•à¸±à¸”à¸ªà¸´à¸™à¹ƒà¸ˆ (à¹€à¸¡à¸•à¸£)
-    DIST_CRITICAL: float = 1.8   # à¸£à¸°à¸¢à¸°à¹€à¸£à¸´à¹ˆà¸¡à¸«à¸±à¸à¸«à¸¥à¸š
-    DIST_SAFE_PASS: float = 3.5  # à¸£à¸°à¸¢à¸°à¸—à¸µà¹ˆà¸žà¹‰à¸™à¸§à¸±à¸•à¸–à¸¸à¹à¸¥à¹‰à¸§
+    # เงื่อนไขระยะปลอดภัย (เมตร)
+    DIST_CRITICAL: float = 1.8   # ระยะที่รถต้องเริ่มหยุด/หลบ
+    DIST_SAFE_PASS: float = 3.8  # ระยะที่รถถือว่าแซงพ้นวัตถุแล้ว
     
-    # à¹€à¸§à¸¥à¸²à¹ƒà¸™à¹à¸•à¹ˆà¸¥à¸°à¸ªà¸–à¸²à¸™à¸° (à¸§à¸´à¸™à¸²à¸—à¸µ)
-    WAIT_TIME: float = 0.5       # à¸«à¸¢à¸¸à¸”à¸™à¸´à¹ˆà¸‡à¸à¹ˆà¸­à¸™à¸«à¸¥à¸š
-    EVADE_DURATION: float = 1.2  # à¹€à¸§à¸¥à¸²à¹ƒà¸™à¸à¸²à¸£à¸«à¸±à¸à¸«à¸±à¸§à¸£à¸–
+    # เวลาในแต่ละ State (วินาที)
+    WAIT_BEFORE_EVADE: float = 0.5
+    EVADE_TIME: float = 1.2
+    
+    # การตั้งค่าเลน
+    roi_top_ratio: float = 0.65
+    canny_low: int = 50
+    canny_high: int = 150
+    lane_origin_y_ratio: float = 0.75
     
     TARGET_CLASSES: list = field(default_factory=lambda: ["person", "car", "bus", "bicycle", "motorcycle"])
     focal_length: float = 500.0
@@ -48,13 +56,14 @@ class Config:
 
 class MotorControl:
     def __init__(self, pins=(23, 24, 5, 6, 27, 27), freq=100):
-        # à¸‚à¸² 23,24 à¸‚à¸±à¸šà¹€à¸„à¸¥à¸·à¹ˆà¸­à¸™ | à¸‚à¸² 5,6 à¹€à¸¥à¸µà¹‰à¸¢à¸§ | à¸‚à¸² 27 PWM
+        # 23,24=Drive | 5,6=Steer | 27=PWM
+        self.pins = pins
         self.IN1, self.IN2, self.IN3, self.IN4, self.ENA, self.ENB = pins
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(list(pins), GPIO.OUT)
         
-        self.pwm_drive = GPIO.PWM(self.ENA, freq)
-        self.pwm_drive.start(0)
+        self.pwm = GPIO.PWM(self.ENA, freq)
+        self.pwm.start(0)
         self.current_angle = 90.0
         self.current_speed = 0
 
@@ -63,58 +72,56 @@ class MotorControl:
         self.current_speed = speed
         diff = angle - 90.0
         
-        # à¸‚à¸±à¸šà¹€à¸„à¸¥à¸·à¹ˆà¸­à¸™à¸¥à¹‰à¸­à¸«à¸¥à¸±à¸‡
+        # ขับเคลื่อนล้อหลัง (Forward)
         GPIO.output(self.IN1, GPIO.HIGH); GPIO.output(self.IN2, GPIO.LOW)
         
-        # à¸šà¸±à¸‡à¸„à¸±à¸šà¹€à¸¥à¸µà¹‰à¸¢à¸§à¸¥à¹‰à¸­à¸«à¸™à¹‰à¸²
-        if diff < -5: # à¹€à¸¥à¸µà¹‰à¸¢à¸§à¸‹à¹‰à¸²à¸¢
+        # บังคับเลี้ยวล้อหน้า (Digital Logic)
+        if diff < -5:   # ซ้าย
             GPIO.output(self.IN3, GPIO.HIGH); GPIO.output(self.IN4, GPIO.LOW)
-        elif diff > 5: # à¹€à¸¥à¸µà¹‰à¸¢à¸§à¸‚à¸§à¸²
+        elif diff > 5:  # ขวา
             GPIO.output(self.IN3, GPIO.LOW); GPIO.output(self.IN4, GPIO.HIGH)
-        else: # à¸¥à¹‰à¸­à¸•à¸£à¸‡
+        else:           # ตรง
             GPIO.output(self.IN3, GPIO.LOW); GPIO.output(self.IN4, GPIO.LOW)
             
-        self.pwm_drive.ChangeDutyCycle(speed)
+        self.pwm.ChangeDutyCycle(speed)
 
-    def stop(self):
-        self.pwm_drive.ChangeDutyCycle(0)
+    def set_stop(self):
+        self.pwm.ChangeDutyCycle(0)
         GPIO.output([self.IN1, self.IN2, self.IN3, self.IN4], GPIO.LOW)
 
     def cleanup(self):
-        self.stop()
+        self.set_stop()
         GPIO.cleanup()
 
-# --- à¸ªà¹ˆà¸§à¸™à¸‚à¸­à¸‡à¸à¸²à¸£à¸•à¸£à¸§à¸ˆà¸ˆà¸±à¸šà¹€à¸¥à¸™à¹à¸¥à¸° PID (à¸ªà¸£à¸¸à¸›à¸¢à¹ˆà¸­à¹€à¸žà¸·à¹ˆà¸­à¸„à¸§à¸²à¸¡à¸à¸£à¸°à¸Šà¸±à¸š) ---
-class LaneAssistant:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        # ... (à¹€à¸žà¸´à¹ˆà¸¡ Logic Lane Detection à¹à¸¥à¸° PID à¸‚à¸­à¸‡à¸„à¸¸à¸“à¸—à¸µà¹ˆà¸™à¸µà¹ˆ) ...
+# --- [Placeholder for LaneProcessor & PID Logic] ---
+# (ส่วนนี้คงไว้ตามฟังก์ชันเดิมที่คุณมีสำหรับการประมวลผล Lane และ PID)
 
 def main(cfg: Config):
     motor = MotorControl()
     cap = cv2.VideoCapture(cfg.source)
     
-    # à¸à¸²à¸£à¸ªà¸·à¹ˆà¸­à¸ªà¸²à¸£à¸à¸±à¸š YOLO Thread
-    frame_q = Queue(maxsize=1); results_q = Queue(maxsize=1); stop_event = threading.Event()
-    yolo_thread = threading.Thread(target=yolo_worker, args=(cfg, frame_q, results_q, stop_event))
-    yolo_thread.start()
+    # Threading สำหรับ YOLO
+    frame_q = Queue(maxsize=1); res_q = Queue(maxsize=1); stop_ev = threading.Event()
+    yolo_worker = threading.Thread(target=yolo_proc, args=(cfg, frame_q, res_q, stop_ev))
+    yolo_worker.start()
 
-    # à¸‚à¹‰à¸­à¸¡à¸¹à¸¥à¸£à¸°à¸šà¸š
+    # ระบบจัดการ State
     current_state = DriveState.NORMAL
-    motor_enabled = False
-    lane_enabled = False
+    motor_active = False
+    lane_assist = False
     last_boxes = []
-    state_start_time = 0
-    evade_direction = 0 # -1:à¸‹à¹‰à¸²à¸¢, 1:à¸‚à¸§à¸²
+    state_start_t = 0
+    evade_side = 1 # 1=ขวา, -1=ซ้าย
 
-    def draw_panel(frame, title, lines, origin):
-        x, y = origin
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x, y), (x + 220, y + (len(lines)+1)*22), (0,0,0), -1)
-        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-        cv2.putText(frame, title, (x+10, y+20), 0, 0.6, (0,255,255), 2)
-        for i, line in enumerate(lines):
-            cv2.putText(frame, line, (x+10, y+45 + i*20), 0, 0.5, (255,255,255), 1)
+    def draw_panel_ui(img, title, lines, pos):
+        x, y = pos
+        h_box = (len(lines) + 1) * 22 + 10
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x, y), (x + 240, y + h_box), (0,0,0), -1)
+        cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+        cv2.putText(img, title, (x+10, y+20), 0, 0.6, (0,255,255), 2)
+        for i, text in enumerate(lines):
+            cv2.putText(img, text, (x+10, y+45 + i*22), 0, 0.5, (255,255,255), 1)
 
     try:
         while True:
@@ -123,89 +130,92 @@ def main(cfg: Config):
             view = cv2.resize(frame, cfg.resolution)
             h, w = view.shape[:2]
 
-            # à¸ªà¹ˆà¸‡à¹€à¸Ÿà¸£à¸¡à¹„à¸›à¹ƒà¸«à¹‰ YOLO
+            # ส่งเฟรมให้ YOLO Thread
             if frame_q.empty(): frame_q.put(view.copy())
             
-            # à¸£à¸±à¸šà¸œà¸¥à¸¥à¸±à¸žà¸˜à¹Œà¸ˆà¸²à¸ YOLO
+            # รับข้อมูลจาก YOLO
             try:
-                last_boxes = results_q.get_nowait()
+                last_boxes = res_q.get_nowait()
             except Empty: pass
 
-            # à¸§à¸´à¹€à¸„à¸£à¸²à¸°à¸«à¹Œà¸ªà¸´à¹ˆà¸‡à¸à¸µà¸”à¸‚à¸§à¸²à¸‡à¹ƒà¸™à¹€à¸¥à¸™
+            # เช็กวัตถุในเลน
             lane_objs = [b for b in last_boxes if b['status'] == 'In Lane']
-            min_dist = min([b['dist'] for b in lane_objs]) if lane_objs else 999
-            
-            # --- à¸£à¸°à¸šà¸šà¸•à¸±à¸”à¸ªà¸´à¸™à¹ƒà¸ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (Autonomous Logic) ---
-            if motor_enabled:
+            min_dist = min([b['dist'] for b in lane_objs]) if lane_objs else 99.0
+
+            # --- Autonomous State Machine Logic ---
+            if motor_active:
                 if current_state == DriveState.NORMAL:
                     if min_dist < cfg.DIST_CRITICAL:
                         current_state = DriveState.STOPPING
-                        state_start_time = time.time()
+                        state_start_t = time.time()
                     else:
-                        motor.drive(90) # à¸•à¸±à¸§à¸­à¸¢à¹ˆà¸²à¸‡à¸§à¸´à¹ˆà¸‡à¸•à¸£à¸‡ (à¹ƒà¸Šà¹‰ PID à¸ˆà¸£à¸´à¸‡à¹ƒà¸™à¸ªà¹ˆà¸§à¸™à¸™à¸µà¹‰)
+                        # ขับตามเลนปกติ (เรียกใช้ PID steering_angle ที่นี่)
+                        motor.drive(90, speed=65)
 
                 elif current_state == DriveState.STOPPING:
-                    motor.stop()
-                    if time.time() - state_start_time > cfg.WAIT_TIME:
-                        # à¹€à¸Šà¹‡à¸à¹€à¸¥à¸™à¸§à¹ˆà¸²à¸‡
+                    motor.set_stop()
+                    if time.time() - state_start_t > cfg.WAIT_BEFORE_EVADE:
+                        # ตัดสินใจเลือกทางหลบ (สแกนพื้นที่ว่างข้างๆ)
                         left_free = not any(b['center'][0] < w*0.3 for b in last_boxes)
                         right_free = not any(b['center'][0] > w*0.7 for b in last_boxes)
                         
-                        if right_free: evade_direction = 1; current_state = DriveState.EVADING
-                        elif left_free: evade_direction = -1; current_state = DriveState.EVADING
-                        state_start_time = time.time()
+                        if right_free:
+                            evade_side = 1; current_state = DriveState.EVADING
+                        elif left_free:
+                            evade_side = -1; current_state = DriveState.EVADING
+                        state_start_t = time.time()
 
                 elif current_state == DriveState.EVADING:
-                    # à¸«à¸±à¸à¸«à¸±à¸§à¸«à¸¥à¸š
-                    motor.drive(90 + (evade_direction * 30), speed=50)
-                    if time.time() - state_start_time > cfg.EVADE_DURATION:
+                    # หักหลบออก (Manual Angle)
+                    motor.drive(90 + (evade_side * 35), speed=50)
+                    if time.time() - state_start_t > cfg.EVADE_TIME:
                         current_state = DriveState.BYPASSING
 
                 elif current_state == DriveState.BYPASSING:
-                    motor.drive(90, speed=50) # à¸§à¸´à¹ˆà¸‡à¹à¸‹à¸‡
-                    if min_dist > cfg.DIST_SAFE_PASS: # à¸žà¹‰à¸™à¹à¸¥à¹‰à¸§
+                    motor.drive(90, speed=55) # วิ่งแซงขนาน
+                    if min_dist > cfg.DIST_SAFE_PASS: # เมื่อพ้นระยะวัตถุ
                         current_state = DriveState.RETURNING
-                        state_start_time = time.time()
+                        state_start_t = time.time()
 
                 elif current_state == DriveState.RETURNING:
-                    # à¸«à¸±à¸à¸à¸¥à¸±à¸šà¹€à¸‚à¹‰à¸²à¹€à¸¥à¸™
-                    motor.drive(90 - (evade_direction * 30), speed=50)
-                    if time.time() - state_start_time > cfg.EVADE_DURATION:
+                    # หักกลับเข้าเลน
+                    motor.drive(90 - (evade_side * 35), speed=50)
+                    if time.time() - state_start_t > cfg.EVADE_TIME:
                         current_state = DriveState.NORMAL
-
             else:
-                motor.stop()
+                motor.set_stop()
 
-            # --- à¹à¸ªà¸”à¸‡à¸œà¸¥ Dashboard (Panel) ---
-            info = [
-                f"STATE: {current_state}",
-                f"MIN DIST: {min_dist:.1f}m",
-                f"SPEED: {motor.current_speed}%",
-                f"STEER: {motor.current_angle:.1f}"
+            # --- Dashboard Visualization ---
+            status_info = [
+                f"DRIVE MODE: {current_state}",
+                f"OBSTACLE: {min_dist:.1f} m",
+                f"STEERING: {motor.current_angle:.1f}",
+                f"THROTTLE: {motor.current_speed} %"
             ]
-            draw_panel(view, "DRIVING DASHBOARD", info, (10, 10))
+            draw_panel_ui(view, "AUTONOMOUS STATUS", status_info, (10, 10))
 
-            cv2.imshow("Autonomous System", view)
+            cv2.imshow("Raspberry Pi 4 Autonomous Car", view)
+            
             key = cv2.waitKey(1)
-            if key == ord('m'): motor_enabled = not motor_enabled
             if key == ord('q'): break
+            if key == ord('m'): motor_active = not motor_active
+            if key == ord('e'): lane_assist = not lane_assist
 
     finally:
-        stop_event.set()
+        stop_ev.set()
         motor.cleanup()
         cap.release()
+        cv2.destroyAllWindows()
 
-def yolo_worker(cfg, f_q, r_q, s_ev):
+def yolo_proc(cfg, f_q, r_q, s_ev):
     model = YOLO(cfg.model_path)
     while not s_ev.is_set():
         try:
             img = f_q.get(timeout=1)
-            res = model.predict(img, imgsz=cfg.imgsz, verbose=False)
-            boxes = []
-            for b in res[0].boxes:
-                # Logic à¸„à¸³à¸™à¸§à¸“à¸£à¸°à¸¢à¸°à¸—à¸²à¸‡à¹à¸¥à¸°à¸ªà¸–à¸²à¸™à¸° (In Lane / Out Lane)
-                pass 
-            r_q.put(boxes)
+            results = model.predict(img, imgsz=cfg.imgsz, verbose=False)
+            detected = []
+            # ... (Logic คำนวณระยะทางและระบุ In Lane/Out Lane) ...
+            r_q.put(detected)
         except: continue
 
 if __name__ == "__main__":
