@@ -20,7 +20,7 @@ class Config:
     model_path: str = "/home/rpi/yolo/yolo11n.pt"
     source: any = 0
     resolution: tuple = (480, 320)
-    conf_thresh: float = 0.25  # เพิ่มความมั่นใจในการ detect
+    conf_thresh: float = 0.25  # à¹€à¸žà¸´à¹ˆà¸¡à¸„à¸§à¸²à¸¡à¸¡à¸±à¹ˆà¸™à¹ƒà¸ˆà¹ƒà¸™à¸à¸²à¸£ detect
     imgsz: int = 192
     
     # --- Steering & PID Control ---
@@ -36,7 +36,7 @@ class Config:
     canny_low: int = 40
     canny_high: int = 120
     min_lane_slope: float = 0.3
-    poly_fit_deque_len: int = 6 # เพิ่มความนิ่งของเส้น
+    poly_fit_deque_len: int = 6 # à¹€à¸žà¸´à¹ˆà¸¡à¸„à¸§à¸²à¸¡à¸™à¸´à¹ˆà¸‡à¸‚à¸­à¸‡à¹€à¸ªà¹‰à¸™
     poly_fit_margin: int = 50
     poly_min_points_for_fit: int = 15
     
@@ -46,9 +46,9 @@ class Config:
     roi_bottom_right_x_ratio: float = 0.95 
 
     # --- Obstacle Avoidance ---
-    safe_distance: float = 2.5 # ระยะปลอดภัยเริ่มหลบ (เมตร)
-    critical_stop: float = 1.2 # ระยะอันตรายต้องหยุด (เมตร)
-    side_check_width: int = 100 # ความกว้างพิกเซลที่เช็กด้านข้างก่อนหลบ
+    safe_distance: float = 2.5 # à¸£à¸°à¸¢à¸°à¸›à¸¥à¸­à¸”à¸ à¸±à¸¢à¹€à¸£à¸´à¹ˆà¸¡à¸«à¸¥à¸š (à¹€à¸¡à¸•à¸£)
+    critical_stop: float = 1.2 # à¸£à¸°à¸¢à¸°à¸­à¸±à¸™à¸•à¸£à¸²à¸¢à¸•à¹‰à¸­à¸‡à¸«à¸¢à¸¸à¸” (à¹€à¸¡à¸•à¸£)
+    side_check_width: int = 100 # à¸„à¸§à¸²à¸¡à¸à¸§à¹‰à¸²à¸‡à¸žà¸´à¸à¹€à¸‹à¸¥à¸—à¸µà¹ˆà¹€à¸Šà¹‡à¸à¸”à¹‰à¸²à¸™à¸‚à¹‰à¸²à¸‡à¸à¹ˆà¸­à¸™à¸«à¸¥à¸š
     
     focal_length: float = 400.0
     lane_origin_y_ratio: float = 0.80 
@@ -63,33 +63,53 @@ class MotorControl_to_MotorDriver:
         self.IN1, self.IN2 = IN1, IN2
         self.IN3, self.IN4 = IN3, IN4
         self.ENA, self.ENB = ENA, ENB
-        self.S1, self.S2 = S1, S2
+        self.S1, self.S2 = S1, S2 # ขา 5 และ 6 สำหรับ Relay เลี้ยว
+        
         self.current_left_speed = 0
         self.current_right_speed = 0
         self.steering_range = steering_range
         self.center_angle = 90.0
+        self.current_angle = self.center_angle
         
         if GPIO_MODE:
             GPIO.setmode(GPIO.BCM)
             for pin in [self.IN1, self.IN2, self.IN3, self.IN4, self.ENA, self.ENB, self.S1, self.S2]:
                 GPIO.setup(pin, GPIO.OUT)
+            
             self.pwm_left = GPIO.PWM(self.ENA, freq)
             self.pwm_right = GPIO.PWM(self.ENB, freq)
             self.pwm_left.start(0)
             self.pwm_right.start(0)
-            self.current_angle = self.center_angle
+
+    def steer_left(self):
+        if GPIO_MODE:
+            GPIO.output(self.S1, GPIO.HIGH)
+            GPIO.output(self.S2, GPIO.LOW)
+
+    def steer_right(self):
+        if GPIO_MODE:
+            GPIO.output(self.S1, GPIO.LOW)
+            GPIO.output(self.S2, GPIO.HIGH)
+
+    def steer_straight(self):
+        """ ฟังก์ชันที่ขาดหายไป: สั่งล้อตรง (ปิด Relay ทั้งคู่) """
+        if GPIO_MODE:
+            GPIO.output(self.S1, GPIO.LOW)
+            GPIO.output(self.S2, GPIO.LOW)
 
     def steer(self, angle):
+        """ ฟังก์ชันสำหรับสั่งเลี้ยวตามองศา (Mapping เข้ากับ Relay) """
         self.current_angle = angle
         dev = angle - self.center_angle
-        if dev < -5: # Left
-            GPIO.output(self.S1, GPIO.HIGH); GPIO.output(self.S2, GPIO.LOW)
-        elif dev > 5: # Right
-            GPIO.output(self.S1, GPIO.LOW); GPIO.output(self.S2, GPIO.HIGH)
-        else:
-            GPIO.output(self.S1, GPIO.LOW); GPIO.output(self.S2, GPIO.LOW)
+        if dev < -5: # เลี้ยวซ้าย
+            self.steer_left()
+        elif dev > 5: # เลี้ยวขวา
+            self.steer_right()
+        else: # ตรง
+            self.steer_straight()
 
     def drive(self, speed):
+        """ ฟังก์ชันสั่งเคลื่อนที่ไปข้างหน้าด้วยความเร็วที่กำหนด """
         self.current_left_speed = speed
         self.current_right_speed = speed
         if GPIO_MODE:
@@ -98,15 +118,23 @@ class MotorControl_to_MotorDriver:
             self.pwm_left.ChangeDutyCycle(speed)
             self.pwm_right.ChangeDutyCycle(speed)
 
+    def move_to(self, angle, base_speed=60):
+        """ ฟังก์ชันเดิม: รวมทั้งเลี้ยวและขับเคลื่อน """
+        self.steer(angle)
+        self.drive(base_speed)
+
     def set_stop(self):
         if GPIO_MODE:
             self.pwm_left.ChangeDutyCycle(0)
             self.pwm_right.ChangeDutyCycle(0)
-            GPIO.output(self.S1, GPIO.LOW); GPIO.output(self.S2, GPIO.LOW)
+            GPIO.output(self.IN1, GPIO.LOW); GPIO.output(self.IN2, GPIO.LOW)
+            GPIO.output(self.IN3, GPIO.LOW); GPIO.output(self.IN4, GPIO.LOW)
+            self.steer_straight()
 
     def stop(self):
         if GPIO_MODE:
-            self.pwm_left.stop(); self.pwm_right.stop()
+            self.pwm_left.stop()
+            self.pwm_right.stop()
             GPIO.cleanup()
 class Safety:
     def __init__(self, move_stop=2.0, move_to=5.0):
@@ -368,26 +396,41 @@ class LaneKeeper:
         return final_angle, deviation, (lane_center, y_ref)
 def estimate_distance(cfg: Config, box_h: int, label: str) -> float:
     if box_h <= 0: return float("inf")
-    real_h = cfg.OBJECT_REAL_HEIGHTS.get(label, cfg.DEFAULT_OBJECT_HEIGHT)
-    return (cfg.focal_length * real_h) / box_h
-
+    real_height = cfg.OBJECT_REAL_HEIGHTS.get(label, cfg.DEFAULT_OBJECT_HEIGHT)
+    distance = (cfg.focal_length * real_height) / box_h
+    return distance
 def yolo_worker(cfg, frame_queue, results_queue, stop_event):
+    print("[INFO] YOLO worker thread started.")
     model = YOLO(cfg.model_path)
-    target_ids = [k for k, v in model.names.items() if v in cfg.TARGET_CLASSES]
+    all_class_names = model.names
+    target_class_ids = [k for k, v in all_class_names.items() if v in cfg.TARGET_CLASSES]
+    print(f"[INFO] YOLO worker will only detect the following classes: {cfg.TARGET_CLASSES}")
     while not stop_event.is_set():
         try:
-            frame = frame_queue.get(timeout=0.5)
+            frame = frame_queue.get(timeout=1)
             if frame is None: break
-            results = model.predict(frame, imgsz=cfg.imgsz, conf=cfg.conf_thresh, verbose=False, classes=target_ids)
+            t_start = time.time()
+            results = model.predict(
+                frame,
+                imgsz=cfg.imgsz,
+                conf=cfg.conf_thresh,
+                verbose=False,
+                classes=target_class_ids
+            )
+            processing_time = time.time() - t_start
             if results_queue.empty():
-                results_queue.put(results)
-        except Empty: continue
-    print("[INFO] YOLO worker stopped.")
+                results_queue.put((results, processing_time))
+        except Empty:
+            continue
+        except Exception as e:
+            print(f"[ERROR] YOLO worker failed: {e}")
+            if stop_event.is_set(): break
+    print("[INFO] YOLO worker thread stopped.")
 
 def main(cfg: Config):
     lane_detector = LaneDetector(cfg)
     keeper = LaneKeeper(cfg)
-    # ใช้ขา ENA, ENB, S1, S2 ตามที่กำหนด
+    # à¹ƒà¸Šà¹‰à¸‚à¸² ENA, ENB, S1, S2 à¸•à¸²à¸¡à¸—à¸µà¹ˆà¸à¸³à¸«à¸™à¸”
     motor = MotorControl_to_MotorDriver(ENA=12, ENB=13, S1=5, S2=6, steering_range=cfg.STEERING_RANGE)
     auto_stop = Safety(move_stop=2.0, move_to=5.0)
     
@@ -405,10 +448,10 @@ def main(cfg: Config):
     yolo_thread = threading.Thread(target=yolo_worker, args=(cfg, frame_queue, results_queue, stop_event))
     yolo_thread.start()
 
-    # --- ชื่อ Parameter ตามต้นฉบับ ---
-    lane_detection_enabled = False  # ควบคุมด้วยปุ่ม 'L'
-    obj_detect_enabled = False      # ควบคุมด้วยปุ่ม 'e' (เพิ่มมาใหม่เพื่อแยกกัน)
-    motor_enable = False           # ควบคุมด้วยปุ่ม 'm'
+    # --- à¸Šà¸·à¹ˆà¸­ Parameter à¸•à¸²à¸¡à¸•à¹‰à¸™à¸‰à¸šà¸±à¸š ---
+    lane_detection_enabled = False  # à¸„à¸§à¸šà¸„à¸¸à¸¡à¸”à¹‰à¸§à¸¢à¸›à¸¸à¹ˆà¸¡ 'L'
+    obj_detect_enabled = False      # à¸„à¸§à¸šà¸„à¸¸à¸¡à¸”à¹‰à¸§à¸¢à¸›à¸¸à¹ˆà¸¡ 'e' (à¹€à¸žà¸´à¹ˆà¸¡à¸¡à¸²à¹ƒà¸«à¸¡à¹ˆà¹€à¸žà¸·à¹ˆà¸­à¹à¸¢à¸à¸à¸±à¸™)
+    motor_enable = False           # à¸„à¸§à¸šà¸„à¸¸à¸¡à¸”à¹‰à¸§à¸¢à¸›à¸¸à¹ˆà¸¡ 'm'
     
     last_known_boxes = []
     frame_counter = 0
@@ -442,14 +485,14 @@ def main(cfg: Config):
             display_frame = cv2.resize(frame, cfg.resolution)
             h, w = display_frame.shape[:2]
 
-            # --- 1. YOLO Processing Logic (ควบคุมด้วยปุ่ม 'e') ---
+            # --- 1. YOLO Processing Logic (à¸„à¸§à¸šà¸„à¸¸à¸¡à¸”à¹‰à¸§à¸¢à¸›à¸¸à¹ˆà¸¡ 'e') ---
             frame_counter += 1
-            if obj_detect_enabled: # เช็คสถานะการเปิดตรวจจับวัตถุ
+            if obj_detect_enabled: # à¹€à¸Šà¹‡à¸„à¸ªà¸–à¸²à¸™à¸°à¸à¸²à¸£à¹€à¸›à¸´à¸”à¸•à¸£à¸§à¸ˆà¸ˆà¸±à¸šà¸§à¸±à¸•à¸–à¸¸
                 if frame_counter % 3 == 0 and frame_queue.empty():
                     frame_queue.put(np.copy(display_frame))
             
             try:
-                # ดึงผลลัพธ์จาก YOLO Thread
+                # à¸”à¸¶à¸‡à¸œà¸¥à¸¥à¸±à¸žà¸˜à¹Œà¸ˆà¸²à¸ YOLO Thread
                 new_results, yolo_time = results_queue.get_nowait()
                 if yolo_time > 0: yolo_fps = 1.0 / yolo_time
                 temp_boxes = []
@@ -459,22 +502,22 @@ def main(cfg: Config):
                     dist = estimate_distance(cfg, y2 - y1, label)
                     bcx, bcy = (x1 + x2) // 2, y2
                     
-                    # ตรวจสอบว่าวัตถุอยู่ในเส้นทางหลักหรือไม่ (ใช้ lane_mask ช่วย)
-                    # lane_mask จะถูกอัปเดตเสมอถ้ามีการ detect lane
-                    if 0 <= bcy < h and 0 <= bcx < w and lane_mask[bcy, bcx] == 255:
-                        status, color = "In Lane", (0, 255, 0)
-                    else:
-                        status, color = "Side Area", (255, 255, 0)
-                        
+                    status = "In Lane" if (0 <= bcy < h and 0 <= bcx < w and lane_mask[bcy, bcx] == 255) else "Side"
+                    
                     temp_boxes.append({
-                        "xyxy": (x1, y1, x2, y2), "label": label, "dist": dist, 
-                        "center": (bcx, bcy), "color": color, "status": status
+                        "xyxy": (x1, y1, x2, y2), 
+                        "label": label, 
+                        "dist": dist, 
+                        "center": (bcx, bcy), 
+                        "cx": bcx, # เพิ่มค่านี้เพื่อให้ Logic หลบหลีกเรียกใช้ได้
+                        "color": (0, 255, 0) if status == "In Lane" else (255, 255, 0), 
+                        "status": status
                     })
                 last_known_boxes = temp_boxes
             except Empty:
                 pass
 
-            # วาดกรอบวัตถุถ้าเปิดโหมดไว้
+            # à¸§à¸²à¸”à¸à¸£à¸­à¸šà¸§à¸±à¸•à¸–à¸¸à¸–à¹‰à¸²à¹€à¸›à¸´à¸”à¹‚à¸«à¸¡à¸”à¹„à¸§à¹‰
             if obj_detect_enabled:
                 for box_data in last_known_boxes:
                     (x1, y1, x2, y2) = box_data["xyxy"]
@@ -483,13 +526,13 @@ def main(cfg: Config):
                     cv2.putText(display_frame, f"{label} {d:.1f}m", (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            # --- 2. Lane Processing Logic (ควบคุมด้วยปุ่ม 'L') ---
+            # --- 2. Lane Processing Logic (à¸„à¸§à¸šà¸„à¸¸à¸¡à¸”à¹‰à¸§à¸¢à¸›à¸¸à¹ˆà¸¡ 'L') ---
             left_fit, right_fit = None, None
-            # ล้างค่า mask ทุกรอบเพื่อป้องกันความผิดพลาด
+            # à¸¥à¹‰à¸²à¸‡à¸„à¹ˆà¸² mask à¸—à¸¸à¸à¸£à¸­à¸šà¹€à¸žà¸·à¹ˆà¸­à¸›à¹‰à¸­à¸‡à¸à¸±à¸™à¸„à¸§à¸²à¸¡à¸œà¸´à¸”à¸žà¸¥à¸²à¸”
             lane_mask = np.zeros(display_frame.shape[:2], dtype=np.uint8)
 
             t_lane_start = time.time()
-            # ทำการคำนวณเลนเสมอเพื่อใช้ในระบบหลบหลีก (แต่จะแสดงผลและเก็บประวัติเมื่อเปิดปุ่ม L)
+            # à¸—à¸³à¸à¸²à¸£à¸„à¸³à¸™à¸§à¸“à¹€à¸¥à¸™à¹€à¸ªà¸¡à¸­à¹€à¸žà¸·à¹ˆà¸­à¹ƒà¸Šà¹‰à¹ƒà¸™à¸£à¸°à¸šà¸šà¸«à¸¥à¸šà¸«à¸¥à¸µà¸ (à¹à¸•à¹ˆà¸ˆà¸°à¹à¸ªà¸”à¸‡à¸œà¸¥à¹à¸¥à¸°à¹€à¸à¹‡à¸šà¸›à¸£à¸°à¸§à¸±à¸•à¸´à¹€à¸¡à¸·à¹ˆà¸­à¹€à¸›à¸´à¸”à¸›à¸¸à¹ˆà¸¡ L)
             left_fit, right_fit = lane_detector.detect_lanes(display_frame)
             lane_time = time.time() - t_lane_start
             if lane_time > 0: lane_fps = 1.0 / lane_time
@@ -497,10 +540,10 @@ def main(cfg: Config):
             if left_fit is not None and right_fit is not None:
                 lane_mask = lane_detector.get_lane_area_mask(display_frame.shape, left_fit, right_fit)
                 
-                # แสดงผลเส้นเลนเฉพาะเมื่อกดปุ่ม L
+                # à¹à¸ªà¸”à¸‡à¸œà¸¥à¹€à¸ªà¹‰à¸™à¹€à¸¥à¸™à¹€à¸‰à¸žà¸²à¸°à¹€à¸¡à¸·à¹ˆà¸­à¸à¸”à¸›à¸¸à¹ˆà¸¡ L
                 if lane_detection_enabled:
                     display_frame = lane_detector.draw_lanes(display_frame, left_fit, right_fit)
-                    # สร้าง Overlay พื้นที่ในเลนให้ดูโปร่งแสง
+                    # à¸ªà¸£à¹‰à¸²à¸‡ Overlay à¸žà¸·à¹‰à¸™à¸—à¸µà¹ˆà¹ƒà¸™à¹€à¸¥à¸™à¹ƒà¸«à¹‰à¸”à¸¹à¹‚à¸›à¸£à¹ˆà¸‡à¹à¸ªà¸‡
                     overlay = np.zeros_like(display_frame)
                     plot_y = np.linspace(int(h * cfg.roi_top_ratio), h - 1, 20)
                     left_fit_x = lane_detector._get_x_at_y(left_fit, plot_y)
@@ -509,7 +552,7 @@ def main(cfg: Config):
                         pts_left = np.asarray([left_fit_x, plot_y]).T
                         pts_right = np.asarray([right_fit_x, plot_y]).T
                         points = np.vstack([pts_left, np.flipud(pts_right)]).astype(np.int32)
-                        cv2.fillPoly(overlay, [points], (0, 255, 100)) # สีเขียวจางๆ
+                        cv2.fillPoly(overlay, [points], (0, 255, 100)) # à¸ªà¸µà¹€à¸‚à¸µà¸¢à¸§à¸ˆà¸²à¸‡à¹†
                         display_frame = cv2.addWeighted(overlay, 0.15, display_frame, 0.85, 0)
 
             # --- 3. Driving Logic & Smart Avoidance ---
@@ -517,7 +560,7 @@ def main(cfg: Config):
             is_blocked, current_min_dist = auto_stop.movement_update(last_known_boxes)
             
             if motor_enable:
-                # เงื่อนไขการหลบหลีก (เช็กระยะเบี่ยงหลบที่สมจริง)
+                # à¹€à¸‡à¸·à¹ˆà¸­à¸™à¹„à¸‚à¸à¸²à¸£à¸«à¸¥à¸šà¸«à¸¥à¸µà¸ (à¹€à¸Šà¹‡à¸à¸£à¸°à¸¢à¸°à¹€à¸šà¸µà¹ˆà¸¢à¸‡à¸«à¸¥à¸šà¸—à¸µà¹ˆà¸ªà¸¡à¸ˆà¸£à¸´à¸‡)
                 if is_blocked and obj_detect_enabled:
                     in_lane_objs = [b for b in last_known_boxes if b['status'] == 'In Lane']
                     if in_lane_objs:
@@ -525,36 +568,36 @@ def main(cfg: Config):
                         obj_x = target['center'][0]
                         img_center = w // 2
                         
-                        # --- ตรวจสอบเส้นทางที่จะเบี่ยงหลบ (Side Check) ---
-                        if obj_x < img_center: # วัตถุขวางอยู่ซ้าย -> ต้องหลบขวา
-                            # เช็กพื้นที่ด้านขวาว่ามีวัตถุประชิดอยู่ไหม
+                        # --- à¸•à¸£à¸§à¸ˆà¸ªà¸­à¸šà¹€à¸ªà¹‰à¸™à¸—à¸²à¸‡à¸—à¸µà¹ˆà¸ˆà¸°à¹€à¸šà¸µà¹ˆà¸¢à¸‡à¸«à¸¥à¸š (Side Check) ---
+                        if obj_x < img_center: # à¸§à¸±à¸•à¸–à¸¸à¸‚à¸§à¸²à¸‡à¸­à¸¢à¸¹à¹ˆà¸‹à¹‰à¸²à¸¢ -> à¸•à¹‰à¸­à¸‡à¸«à¸¥à¸šà¸‚à¸§à¸²
+                            # à¹€à¸Šà¹‡à¸à¸žà¸·à¹‰à¸™à¸—à¸µà¹ˆà¸”à¹‰à¸²à¸™à¸‚à¸§à¸²à¸§à¹ˆà¸²à¸¡à¸µà¸§à¸±à¸•à¸–à¸¸à¸›à¸£à¸°à¸Šà¸´à¸”à¸­à¸¢à¸¹à¹ˆà¹„à¸«à¸¡
                             is_right_clear = not any(b for b in last_known_boxes if b['center'][0] > img_center + 50 and b['dist'] < 2.5)
                             if is_right_clear:
                                 motor.steer_right()
-                                print(f"[避] Avoiding Obstacle: Right Turn (Dist: {target['dist']:.1f}m)")
+                                print(f"[é¿] Avoiding Obstacle: Right Turn (Dist: {target['dist']:.1f}m)")
                             else:
-                                motor.set_stop() # ถ้าไม่ปลอดภัยทั้งสองฝั่งให้หยุด
+                                motor.set_stop() # à¸–à¹‰à¸²à¹„à¸¡à¹ˆà¸›à¸¥à¸­à¸”à¸ à¸±à¸¢à¸—à¸±à¹‰à¸‡à¸ªà¸­à¸‡à¸à¸±à¹ˆà¸‡à¹ƒà¸«à¹‰à¸«à¸¢à¸¸à¸”
                                 print("[!] Critical: Path Blocked on both sides!")
-                        else: # วัตถุขวางอยู่ขวา -> ต้องหลบซ้าย
+                        else: # à¸§à¸±à¸•à¸–à¸¸à¸‚à¸§à¸²à¸‡à¸­à¸¢à¸¹à¹ˆà¸‚à¸§à¸² -> à¸•à¹‰à¸­à¸‡à¸«à¸¥à¸šà¸‹à¹‰à¸²à¸¢
                             is_left_clear = not any(b for b in last_known_boxes if b['center'][0] < img_center - 50 and b['dist'] < 2.5)
                             if is_left_clear:
                                 motor.steer_left()
-                                print(f"[避] Avoiding Obstacle: Left Turn (Dist: {target['dist']:.1f}m)")
+                                print(f"[é¿] Avoiding Obstacle: Left Turn (Dist: {target['dist']:.1f}m)")
                             else:
                                 motor.set_stop()
                                 print("[!] Critical: Path Blocked on both sides!")
                         
-                        # ลดความเร็วขณะเลี้ยวหลบเพื่อความปลอดภัย
+                        # à¸¥à¸”à¸„à¸§à¸²à¸¡à¹€à¸£à¹‡à¸§à¸‚à¸“à¸°à¹€à¸¥à¸µà¹‰à¸¢à¸§à¸«à¸¥à¸šà¹€à¸žà¸·à¹ˆà¸­à¸„à¸§à¸²à¸¡à¸›à¸¥à¸­à¸”à¸ à¸±à¸¢
                         motor.pwm_left.ChangeDutyCycle(35)
                         motor.pwm_right.ChangeDutyCycle(35)
                 
-                # กรณีปกติ: วิ่งตามเลน (ถ้าเปิด L) หรือวิ่งตรง (ถ้าไม่ได้เปิด L)
+                # à¸à¸£à¸“à¸µà¸›à¸à¸•à¸´: à¸§à¸´à¹ˆà¸‡à¸•à¸²à¸¡à¹€à¸¥à¸™ (à¸–à¹‰à¸²à¹€à¸›à¸´à¸” L) à¸«à¸£à¸·à¸­à¸§à¸´à¹ˆà¸‡à¸•à¸£à¸‡ (à¸–à¹‰à¸²à¹„à¸¡à¹ˆà¹„à¸”à¹‰à¹€à¸›à¸´à¸” L)
                 else:
                     if lane_detection_enabled and left_fit is not None and right_fit is not None:
                         steering_angle, _, _ = keeper.calculate_steering((left_fit, right_fit), display_frame.shape)
                         motor.move_to(steering_angle)
                     else:
-                        # วิ่งตรงแบบประคองทิศทาง
+                        # à¸§à¸´à¹ˆà¸‡à¸•à¸£à¸‡à¹à¸šà¸šà¸›à¸£à¸°à¸„à¸­à¸‡à¸—à¸´à¸¨à¸—à¸²à¸‡
                         motor.steer_straight()
                         motor.drive(60)
             else:
@@ -580,13 +623,13 @@ def main(cfg: Config):
             key = cv2.waitKey(1) & 0xFF
             
             if key == ord('q') or key == 27: break
-            if key == ord('l'): # ปุ่ม L ควบคุมเลน
+            if key == ord('l'): # à¸›à¸¸à¹ˆà¸¡ L à¸„à¸§à¸šà¸„à¸¸à¸¡à¹€à¸¥à¸™
                 lane_detection_enabled = not lane_detection_enabled
                 print(f"[UI] Lane Detection: {lane_detection_enabled}")
-            if key == ord('e'): # ปุ่ม e ควบคุมการหาวัตถุ
+            if key == ord('e'): # à¸›à¸¸à¹ˆà¸¡ e à¸„à¸§à¸šà¸„à¸¸à¸¡à¸à¸²à¸£à¸«à¸²à¸§à¸±à¸•à¸–à¸¸
                 obj_detect_enabled = not obj_detect_enabled
                 print(f"[UI] Object Detection: {obj_detect_enabled}")
-            if key == ord('m'): # ปุ่ม m ควบคุมมอเตอร์
+            if key == ord('m'): # à¸›à¸¸à¹ˆà¸¡ m à¸„à¸§à¸šà¸„à¸¸à¸¡à¸¡à¸­à¹€à¸•à¸­à¸£à¹Œ
                 motor_enable = not motor_enable
                 print(f"[UI] Motor Master: {motor_enable}")
     finally:
