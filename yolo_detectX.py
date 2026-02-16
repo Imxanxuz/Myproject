@@ -49,7 +49,7 @@ class Config:
     safe_distance: float = 2.5 
     critical_stop: float = 1.2 
     side_check_width: int = 100 
-    
+    lane_mask_margin: int = 50
     focal_length: float = 400.0
     lane_origin_y_ratio: float = 0.80 
     TARGET_CLASSES: list = field(default_factory=lambda: ["person", "car", "bus", "bicycle", "motorcycle", "dog"])
