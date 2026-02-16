@@ -20,7 +20,7 @@ class Config:
     model_path: str = "/home/rpi/yolo/yolo11n.pt"
     source: any = 0
     resolution: tuple = (480, 320)
-    conf_thresh: float = 0.25  # à¹€à¸žà¸´à¹ˆà¸¡à¸„à¸§à¸²à¸¡à¸¡à¸±à¹ˆà¸™à¹ƒà¸ˆà¹ƒà¸™à¸à¸²à¸£ detect
+    conf_thresh: float = 0.25  
     imgsz: int = 192
     
     # --- Steering & PID Control ---
@@ -36,7 +36,7 @@ class Config:
     canny_low: int = 40
     canny_high: int = 120
     min_lane_slope: float = 0.3
-    poly_fit_deque_len: int = 6 # à¹€à¸žà¸´à¹ˆà¸¡à¸„à¸§à¸²à¸¡à¸™à¸´à¹ˆà¸‡à¸‚à¸­à¸‡à¹€à¸ªà¹‰à¸™
+    poly_fit_deque_len: int = 6
     poly_fit_margin: int = 50
     poly_min_points_for_fit: int = 15
     
@@ -46,9 +46,9 @@ class Config:
     roi_bottom_right_x_ratio: float = 0.95 
 
     # --- Obstacle Avoidance ---
-    safe_distance: float = 2.5 # à¸£à¸°à¸¢à¸°à¸›à¸¥à¸­à¸”à¸ à¸±à¸¢à¹€à¸£à¸´à¹ˆà¸¡à¸«à¸¥à¸š (à¹€à¸¡à¸•à¸£)
-    critical_stop: float = 1.2 # à¸£à¸°à¸¢à¸°à¸­à¸±à¸™à¸•à¸£à¸²à¸¢à¸•à¹‰à¸­à¸‡à¸«à¸¢à¸¸à¸” (à¹€à¸¡à¸•à¸£)
-    side_check_width: int = 100 # à¸„à¸§à¸²à¸¡à¸à¸§à¹‰à¸²à¸‡à¸žà¸´à¸à¹€à¸‹à¸¥à¸—à¸µà¹ˆà¹€à¸Šà¹‡à¸à¸”à¹‰à¸²à¸™à¸‚à¹‰à¸²à¸‡à¸à¹ˆà¸­à¸™à¸«à¸¥à¸š
+    safe_distance: float = 2.5 
+    critical_stop: float = 1.2 
+    side_check_width: int = 100 
     
     focal_length: float = 400.0
     lane_origin_y_ratio: float = 0.80 
@@ -59,27 +59,33 @@ class Config:
     DEFAULT_OBJECT_HEIGHT: float = 1.0
 
 class MotorControl_to_MotorDriver:
-    def __init__(self, IN1=17, IN2=27, IN3=23, IN4=24, ENA=12, ENB=13, S1=5, S2=6, freq=100, steering_range=(60.0, 120.0)):
-        self.IN1, self.IN2 = IN1, IN2
-        self.IN3, self.IN4 = IN3, IN4
-        self.ENA, self.ENB = ENA, ENB
-        self.S1, self.S2 = S1, S2 # ขา 5 และ 6 สำหรับ Relay เลี้ยว
+    def __init__(self, RPWM=13, LPWM=12, R_EN=17, L_EN=27, S1=5, S2=6, freq=1000):
+        # BTS7960 Pins
+        self.RPWM = RPWM  # Forward PWM
+        self.LPWM = LPWM  # Reverse PWM
+        self.R_EN = R_EN  # Forward Enable
+        self.L_EN = L_EN  # Reverse Enable
         
-        self.current_left_speed = 0
-        self.current_right_speed = 0
-        self.steering_range = steering_range
+        # Relay Pins for Steering (?? P-215)
+        self.S1, self.S2 = S1, S2 
+        
+        self.current_speed = 0
         self.center_angle = 90.0
-        self.current_angle = self.center_angle
         
         if GPIO_MODE:
             GPIO.setmode(GPIO.BCM)
-            for pin in [self.IN1, self.IN2, self.IN3, self.IN4, self.ENA, self.ENB, self.S1, self.S2]:
+            for pin in [self.RPWM, self.LPWM, self.R_EN, self.L_EN, self.S1, self.S2]:
                 GPIO.setup(pin, GPIO.OUT)
             
-            self.pwm_left = GPIO.PWM(self.ENA, freq)
-            self.pwm_right = GPIO.PWM(self.ENB, freq)
-            self.pwm_left.start(0)
-            self.pwm_right.start(0)
+
+            GPIO.output(self.R_EN, GPIO.HIGH)
+            GPIO.output(self.L_EN, GPIO.HIGH)
+            
+
+            self.pwm_forward = GPIO.PWM(self.RPWM, freq)
+            self.pwm_reverse = GPIO.PWM(self.LPWM, freq)
+            self.pwm_forward.start(0)
+            self.pwm_reverse.start(0)
 
     def steer_left(self):
         if GPIO_MODE:
@@ -92,49 +98,49 @@ class MotorControl_to_MotorDriver:
             GPIO.output(self.S2, GPIO.HIGH)
 
     def steer_straight(self):
-        """ ฟังก์ชันที่ขาดหายไป: สั่งล้อตรง (ปิด Relay ทั้งคู่) """
         if GPIO_MODE:
             GPIO.output(self.S1, GPIO.LOW)
             GPIO.output(self.S2, GPIO.LOW)
 
     def steer(self, angle):
-        """ ฟังก์ชันสำหรับสั่งเลี้ยวตามองศา (Mapping เข้ากับ Relay) """
-        self.current_angle = angle
         dev = angle - self.center_angle
-        if dev < -5: # เลี้ยวซ้าย
+        if dev < -5:
             self.steer_left()
-        elif dev > 5: # เลี้ยวขวา
+        elif dev > 5:
             self.steer_right()
-        else: # ตรง
+        else:
             self.steer_straight()
 
     def drive(self, speed):
-        """ ฟังก์ชันสั่งเคลื่อนที่ไปข้างหน้าด้วยความเร็วที่กำหนด """
-        self.current_left_speed = speed
-        self.current_right_speed = speed
+        """ ???????????????????????? (???????? 0-100) """
+        self.current_speed = speed
         if GPIO_MODE:
-            GPIO.output(self.IN1, GPIO.HIGH); GPIO.output(self.IN2, GPIO.LOW)
-            GPIO.output(self.IN3, GPIO.HIGH); GPIO.output(self.IN4, GPIO.LOW)
-            self.pwm_left.ChangeDutyCycle(speed)
-            self.pwm_right.ChangeDutyCycle(speed)
+            # ?????? BTS7960 ????????: ??? PWM ???? RPWM, LPWM ???????? 0
+            self.pwm_reverse.ChangeDutyCycle(0)
+            self.pwm_forward.ChangeDutyCycle(speed)
 
-    def move_to(self, angle, base_speed=60):
-        """ ฟังก์ชันเดิม: รวมทั้งเลี้ยวและขับเคลื่อน """
+    def drive_reverse(self, speed):
+        """ ??????????? (???????? 0-100) """
+        self.current_speed = speed
+        if GPIO_MODE:
+            # ?????? BTS7960 ???????: ??? PWM ???? LPWM, RPWM ???????? 0
+            self.pwm_forward.ChangeDutyCycle(0)
+            self.pwm_reverse.ChangeDutyCycle(speed)
+
+    def move_to(self, angle, base_speed=50): # ???? base_speed ??????????????? BTS7960 ???????????
         self.steer(angle)
         self.drive(base_speed)
 
     def set_stop(self):
         if GPIO_MODE:
-            self.pwm_left.ChangeDutyCycle(0)
-            self.pwm_right.ChangeDutyCycle(0)
-            GPIO.output(self.IN1, GPIO.LOW); GPIO.output(self.IN2, GPIO.LOW)
-            GPIO.output(self.IN3, GPIO.LOW); GPIO.output(self.IN4, GPIO.LOW)
+            self.pwm_forward.ChangeDutyCycle(0)
+            self.pwm_reverse.ChangeDutyCycle(0)
             self.steer_straight()
 
     def stop(self):
         if GPIO_MODE:
-            self.pwm_left.stop()
-            self.pwm_right.stop()
+            self.pwm_forward.stop()
+            self.pwm_reverse.stop()
             GPIO.cleanup()
 class Safety:
     def __init__(self, move_stop=2.0, move_to=5.0):
@@ -431,7 +437,7 @@ def main(cfg: Config):
     lane_detector = LaneDetector(cfg)
     keeper = LaneKeeper(cfg)
     # à¹ƒà¸Šà¹‰à¸‚à¸² ENA, ENB, S1, S2 à¸•à¸²à¸¡à¸—à¸µà¹ˆà¸à¸³à¸«à¸™à¸”
-    motor = MotorControl_to_MotorDriver(ENA=12, ENB=13, S1=5, S2=6, steering_range=cfg.STEERING_RANGE)
+    motor = MotorControl_to_MotorDriver(RPWM=13, LPWM=12, R_EN=17, L_EN=27, S1=5, S2=6)
     auto_stop = Safety(move_stop=2.0, move_to=5.0)
     
     cap = cv2.VideoCapture(cfg.source)
